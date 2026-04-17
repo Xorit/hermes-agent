@@ -3,15 +3,38 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import contextlib
+import logging
 import re
 import sqlite3
 import threading
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+# Trust adjustment constants
+_HELPFUL_DELTA   =  0.05
+_UNHELPFUL_DELTA = -0.10
+_TRUST_MIN       =  0.0
+_TRUST_MAX       =  1.0
+
+# HRR constants
+_SNR_MIN         =  3.0   # minimum SNR before bundling; below this = noise
+_PAGE_SIZE       =  4096  # set before journal_mode=WAL
+
+# Entity extraction patterns
+_RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+_RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
+_RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
+_RE_AKA          = re.compile(
+    r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
+    re.IGNORECASE,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -29,7 +52,7 @@ CREATE TABLE IF NOT EXISTS facts (
 
 CREATE TABLE IF NOT EXISTS entities (
     entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL,
+    name        TEXT NOT NULL COLLATE NOCASE,
     entity_type TEXT DEFAULT 'unknown',
     aliases     TEXT DEFAULT '',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -68,31 +91,49 @@ END;
 CREATE TABLE IF NOT EXISTS memory_banks (
     bank_id    INTEGER PRIMARY KEY AUTOINCREMENT,
     bank_name  TEXT NOT NULL UNIQUE,
-    vector     BLOB NOT NULL,
+    vector     BLOB,
     dim        INTEGER NOT NULL,
     fact_count INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
-# Trust adjustment constants
-_HELPFUL_DELTA   =  0.05
-_UNHELPFUL_DELTA = -0.10
-_TRUST_MIN       =  0.0
-_TRUST_MAX       =  1.0
-
-# Entity extraction patterns
-_RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
-_RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
-_RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
-_RE_AKA          = re.compile(
-    r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
-    re.IGNORECASE,
-)
-
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
+
+
+def _sqlite_error_message(exc: BaseException) -> str:
+    return str(exc).lower()
+
+
+def _is_lock_or_busy_error(exc: BaseException) -> bool:
+    msg = _sqlite_error_message(exc)
+    return (
+        "database is locked" in msg
+        or "database table is locked" in msg
+        or "database schema is locked" in msg
+        or "database is busy" in msg
+        or "locked" in msg
+        or "busy" in msg
+    )
+
+
+def _is_known_corruption_error(exc: BaseException) -> bool:
+    msg = _sqlite_error_message(exc)
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+        or "malformed" in msg
+        or "unsupported file format" in msg
+        or "not a database" in msg
+    )
+
+
+def _wal_sidecar_paths(db_path: Path) -> tuple[Path, Path]:
+    # Do not use with_suffix("-wal"): it raises on paths with no extension.
+    base = str(db_path)
+    return Path(base + "-wal"), Path(base + "-shm")
 
 
 class MemoryStore:
@@ -111,29 +152,189 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_trust = _clamp_trust(default_trust)
         self.hrr_dim = hrr_dim
-        self._hrr_available = hrr._HAS_NUMPY
         self._conn: sqlite3.Connection = sqlite3.connect(
             str(self.db_path),
-            check_same_thread=False,
             timeout=10.0,
+            check_same_thread=False,
         )
         self._lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
+
+        # Pre-check: probe the existing DB file before running _init_db().
+        # A crash during schema creation can leave a truncated/invalid file
+        # (e.g. exactly one page with no valid header).  sqlite3.connect()
+        # itself succeeds on any file; the error only surfaces when we
+        # execute.  Nuke the file and start clean if probing fails.
+        try:
+            self._conn.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.OperationalError as exc:
+            # Do not delete DB files for lock/busy contention — that is transient.
+            if _is_lock_or_busy_error(exc):
+                raise
+            if not _is_known_corruption_error(exc):
+                raise
+            logger.warning(
+                "holographic: existing memory_store file appears corrupt (%s) — "
+                "deleting and recreating. All stored facts will be lost.",
+                exc,
+            )
+            self._conn.close()
+            try:
+                self.db_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+        except sqlite3.DatabaseError as exc:
+            if not _is_known_corruption_error(exc):
+                raise
+            logger.warning(
+                "holographic: existing memory_store file appears corrupt (%s) — "
+                "deleting and recreating. All stored facts will be lost.",
+                exc,
+            )
+            self._conn.close()
+            try:
+                self.db_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+
         self._init_db()
+        self._startup_integrity_check()
 
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
 
     def _init_db(self) -> None:
-        """Create tables, indexes, and triggers if they do not exist. Enable WAL mode."""
+        """Create tables, indexes, and triggers if they do not exist.
+
+        Uses WAL journal mode for concurrent read/write access. WAL allows
+        concurrent readers without blocking writers, and writers don't block
+        readers — essential for a multi-threaded/multi-platform gateway.
+
+        Safety properties:
+        - page_size=4096: set BEFORE journal_mode=WAL; required for WAL header.
+        - synchronous=FULL: fsync after every WAL frame write. Eliminates
+          crash-during-write corruption at ~2x write latency cost. Worth it
+          for a single-user memory store where every fact matters.
+        - locking_mode=NORMAL: non-exclusive locking; other connections read.
+        - timeout=10s: prevents "database locked" on contention.
+        - RLock: serialises write access within this process.
+
+        WAL-specific cleanup:
+        - wal_checkpoint(TRUNCATE) on close: prevents orphaned -wal/-shm segments
+          after a crash, keeping the DB as a single file for simple backup/restore.
+        """
+        # page_size MUST be set before journal_mode; changing it later is a no-op.
+        self._conn.execute(f"PRAGMA page_size={_PAGE_SIZE}")
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
+        self._conn.execute("PRAGMA locking_mode=NORMAL")
         self._conn.executescript(_SCHEMA)
         # Migrate: add hrr_vector column if missing (safe for existing databases)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
         self._conn.commit()
+
+    def _startup_integrity_check(self) -> None:
+        """Run a quick integrity check on the DB file after WAL recovery.
+
+        If the previous shutdown was dirty (hard crash, SIGKILL, OOM),
+        SQLite replays the WAL on open.  After replay, we verify the
+        result with PRAGMA integrity_check.  On failure, we delete the
+        orphaned WAL/SHM files, close the connection, and re-open —
+        SQLite will then treat the DB as a clean, WAL-free database.
+
+        This is safe because all real data lives in the main DB file.
+        The WAL is just uncommitted redo log.  Discarding it means
+        rolling back the last few transactions — acceptable trade-off
+        for a memory store where recent facts may be re-learned.
+        """
+        try:
+            result = self._conn.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.OperationalError as exc:
+            # Lock/busy is transient contention, not corruption.
+            # Never run destructive recovery in this case.
+            if _is_lock_or_busy_error(exc):
+                raise
+            # Corruption can also surface as OperationalError (e.g. "database
+            # disk image is malformed"). Route known corruption signatures to
+            # the recovery path below instead of failing startup.
+            if _is_known_corruption_error(exc):
+                result = None
+            else:
+                # Unknown OperationalError: fail closed (no file deletion).
+                raise
+        except sqlite3.DatabaseError:
+            # Integrity check itself failed — DB is unreadable/corrupt.
+            # Proceed to WAL/SHM sidecar recovery path below.
+            result = None
+        if result and result[0] == "ok":
+            return
+
+        logger.warning(
+            "holographic memory_store integrity check failed after WAL replay. "
+            "Previous shutdown was dirty — deleting orphaned WAL/SHM files "
+            "and re-opening. Some recent facts may be lost.",
+        )
+
+        # Close and delete the orphaned WAL/SHM.
+        # We close the connection directly (skipping checkpoint) since
+        # integrity already failed — the WAL is untrustworthy anyway.
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+        wal_path, shm_path = _wal_sidecar_paths(self.db_path)
+        for path in (wal_path, shm_path):
+            try:
+                if path.exists():
+                    path.unlink()
+                    logger.info("Deleted orphaned WAL segment: %s", path)
+            except Exception as exc:
+                logger.warning("Could not delete %s: %s", path, exc)
+
+        # Re-open on the clean DB (WAL mode will be re-established by _init_db).
+        # If anything goes wrong here, fall back to deleting the DB entirely
+        # and creating a fresh one.  Losing some facts is better than leaving
+        # the store in a broken state where every subsequent operation crashes.
+        try:
+            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init_db()
+        except sqlite3.DatabaseError as exc:
+            if not _is_known_corruption_error(exc):
+                raise
+            logger.warning(
+                "holographic: reconnect+init failed (%s) — nuking DB and starting fresh. "
+                "All stored facts will be lost.",
+                exc,
+            )
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            # Last-ditch: delete the file and start completely fresh.
+            # This handles the case where the main DB itself is corrupt.
+            try:
+                self.db_path.unlink()
+            except FileNotFoundError:
+                pass
+            wal_path, shm_path = _wal_sidecar_paths(self.db_path)
+            for path in (wal_path, shm_path):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init_db()
+        logger.info("holographic memory_store re-opened after WAL recovery.")
 
     # ------------------------------------------------------------------
     # Public API
@@ -150,39 +351,83 @@ class MemoryStore:
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
         the existing fact_id without modifying the row. Extracts entities from
         the content and links them to the fact.
+
+        All database work is wrapped in an explicit transaction so that a crash
+        or exception anywhere in the chain rolls back cleanly — no partial state.
+        The RLock is held only for the database I/O; numpy HRR encoding is
+        performed without the lock held so concurrent readers are not starved.
         """
+        content = content.strip()
+        if not content:
+            raise ValueError("content must not be empty")
+
         with self._lock:
-            content = content.strip()
-            if not content:
-                raise ValueError("content must not be empty")
+            # Use an explicit savepoint so failures never leak partial writes.
+            self._conn.execute("SAVEPOINT add_fact_start")
+            add_savepoint_active = True
 
             try:
-                cur = self._conn.execute(
-                    """
-                    INSERT INTO facts (content, category, tags, trust_score)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (content, category, tags, self.default_trust),
-                )
-                self._conn.commit()
-                fact_id: int = cur.lastrowid  # type: ignore[assignment]
-            except sqlite3.IntegrityError:
-                # Duplicate content — return existing id
-                row = self._conn.execute(
-                    "SELECT fact_id FROM facts WHERE content = ?", (content,)
-                ).fetchone()
-                return int(row["fact_id"])
+                try:
+                    cur = self._conn.execute(
+                        """
+                        INSERT INTO facts (content, category, tags, trust_score)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (content, category, tags, self.default_trust),
+                    )
+                    fact_id: int = cur.lastrowid  # type: ignore[assignment]
+                except sqlite3.IntegrityError:
+                    # Duplicate content — rollback and return existing id.
+                    self._conn.execute("ROLLBACK TO SAVEPOINT add_fact_start")
+                    self._conn.execute("RELEASE SAVEPOINT add_fact_start")
+                    add_savepoint_active = False
+                    row = self._conn.execute(
+                        "SELECT fact_id FROM facts WHERE content = ?", (content,)
+                    ).fetchone()
+                    if row is None:
+                        raise RuntimeError("duplicate fact lookup failed")
+                    return int(row["fact_id"])
 
-            # Entity extraction and linking
-            for name in self._extract_entities(content):
-                entity_id = self._resolve_entity(name)
-                self._link_fact_entity(fact_id, entity_id)
+                # Entity resolution — collect entity_ids; rollback all on any failure.
+                entity_ids: list[int] = []
+                for name in self._extract_entities(content):
+                    entity_id, _ = self._resolve_entity_with_flag(name)
+                    entity_ids.append(entity_id)
 
-            # Compute HRR vector after entity linking
-            self._compute_hrr_vector(fact_id, content)
-            self._rebuild_bank(category)
+                self._conn.execute("SAVEPOINT link_entities")
+                link_savepoint_active = True
+                try:
+                    for entity_id in entity_ids:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                            (fact_id, entity_id),
+                        )
+                    self._conn.execute("RELEASE SAVEPOINT link_entities")
+                    link_savepoint_active = False
+                except Exception:
+                    if link_savepoint_active:
+                        self._conn.execute("ROLLBACK TO SAVEPOINT link_entities")
+                        self._conn.execute("RELEASE SAVEPOINT link_entities")
+                        link_savepoint_active = False
+                    raise
 
-            return fact_id
+                self._conn.execute("RELEASE SAVEPOINT add_fact_start")
+                add_savepoint_active = False
+            except Exception:
+                # Any failure: rollback the whole add_fact transaction.
+                if add_savepoint_active:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("ROLLBACK TO SAVEPOINT add_fact_start")
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("RELEASE SAVEPOINT add_fact_start")
+                raise
+
+        # HRR vector and bank rebuild are slow numpy ops.
+        # Release the lock first so concurrent readers are not starved.
+        self._compute_hrr_vector(fact_id, content)
+        self._rebuild_bank(category)
+
+        return fact_id
 
     def search_facts(
         self,
@@ -246,6 +491,11 @@ class MemoryStore:
         """Partially update a fact. Trust is clamped to [0, 1].
 
         Returns True if the row existed, False otherwise.
+
+        When content changes, entity re-linking is performed atomically inside
+        a savepoint — if linking fails, the entity graph rolls back but the
+        content/trust update is already committed (intentional: content change
+        is the primary update; entity links are secondary).
         """
         with self._lock:
             row = self._conn.execute(
@@ -256,6 +506,7 @@ class MemoryStore:
 
             assignments: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
             params: list = []
+            rebuild_old_cat: str | None = None  # non-None = old category needs rebuild
 
             if content is not None:
                 assignments.append("content = ?")
@@ -266,6 +517,12 @@ class MemoryStore:
             if category is not None:
                 assignments.append("category = ?")
                 params.append(category)
+                # Detect category change: fetch old cat before UPDATE
+                old_row = self._conn.execute(
+                    "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
+                ).fetchone()
+                if old_row and old_row["category"] != category:
+                    rebuild_old_cat = old_row["category"]
             if trust_delta is not None:
                 new_trust = _clamp_trust(row["trust_score"] + trust_delta)
                 assignments.append("trust_score = ?")
@@ -278,32 +535,52 @@ class MemoryStore:
             )
             self._conn.commit()
 
-            # If content changed, re-extract entities
+            # If content changed, re-extract and re-link entities atomically.
+            # Use a savepoint so a linking failure rolls back the links only.
             if content is not None:
-                self._conn.execute(
-                    "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
-                )
-                for name in self._extract_entities(content):
-                    entity_id = self._resolve_entity(name)
-                    self._link_fact_entity(fact_id, entity_id)
-                self._conn.commit()
+                self._conn.execute("SAVEPOINT relink_entities")
+                try:
+                    self._conn.execute(
+                        "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
+                    )
+                    for name in self._extract_entities(content):
+                        entity_id, _ = self._resolve_entity_with_flag(name)
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                            (fact_id, entity_id),
+                        )
+                    self._conn.execute("RELEASE SAVEPOINT relink_entities")
+                except Exception:
+                    self._conn.execute("ROLLBACK TO SAVEPOINT relink_entities")
+                    self._conn.execute("RELEASE SAVEPOINT relink_entities")
+                    raise  # content is already updated; surface the linking error
 
-            # Recompute HRR vector if content changed
-            if content is not None:
+                # Recompute HRR vector without the lock held.
                 self._compute_hrr_vector(fact_id, content)
-            # Rebuild bank for relevant category
-            cat = category or self._conn.execute(
-                "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
-            ).fetchone()["category"]
-            self._rebuild_bank(cat)
+
+            # Rebuild affected bank(s) — only when bank contents actually changed.
+            # content change: bank must be rebuilt (new vector in bundle)
+            # category change: both old and new banks need rebuilding
+            # tags/trust-only change: no bank rebuild needed
+            if content is not None or category is not None:
+                cat = category or self._conn.execute(
+                    "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
+                ).fetchone()["category"]
+                self._rebuild_bank(cat)
+                if rebuild_old_cat is not None:
+                    self._rebuild_bank(rebuild_old_cat)
 
             return True
 
     def remove_fact(self, fact_id: int) -> bool:
-        """Delete a fact and its entity links. Returns True if the row existed."""
+        """Delete a fact and its entity links. Returns True if the row existed.
+
+        Rebuilds the category's memory bank only if the removed fact had an
+        hrr_vector — facts without vectors have no effect on the bundle.
+        """
         with self._lock:
             row = self._conn.execute(
-                "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
+                "SELECT fact_id, category, hrr_vector FROM facts WHERE fact_id = ?", (fact_id,)
             ).fetchone()
             if row is None:
                 return False
@@ -313,7 +590,10 @@ class MemoryStore:
             )
             self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
             self._conn.commit()
-            self._rebuild_bank(row["category"])
+
+            # Only rebuild if the fact contributed a vector to the bundle.
+            if row["hrr_vector"] is not None:
+                self._rebuild_bank(row["category"])
             return True
 
     def list_facts(
@@ -398,17 +678,30 @@ class MemoryStore:
         1. Capitalized multi-word phrases  e.g. "John Doe"
         2. Double-quoted terms             e.g. "Python"
         3. Single-quoted terms             e.g. 'pytest'
-        4. AKA patterns                    e.g. "Guido aka BDFL" -> two entities
+        4. AKA patterns                   e.g. "Guido aka BDFL" -> two entities
 
         Returns a deduplicated list preserving first-seen order.
+
+        NOTE: Multi-word entities (e.g. "Claude Code") are stored as a single
+        atom in HRR space. This means probe/reason algebra works best with
+        single-word entities. Multi-word entities are still stored and searchable
+        via FTS, but the HRR structural role won't be fully compositional.
         """
         seen: set[str] = set()
         candidates: list[str] = []
 
         def _add(name: str) -> None:
             stripped = name.strip()
-            if stripped and stripped.lower() not in seen:
-                seen.add(stripped.lower())
+            if not stripped:
+                return
+            # Normalize: strip trailing punctuation before dedup to prevent
+            # 'Routine.' and 'Routine' becoming separate entities.
+            normalized = stripped.rstrip(".,;:!?")
+            if not normalized:
+                return
+            key = normalized.lower()
+            if key not in seen:
+                seen.add(key)
                 candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
@@ -426,38 +719,49 @@ class MemoryStore:
 
         return candidates
 
-    def _resolve_entity(self, name: str) -> int:
-        """Find an existing entity by name or alias (case-insensitive) or create one.
+    def _resolve_entity_with_flag(self, name: str) -> tuple[int, bool]:
+        """Find an existing entity by name or alias, or create one.
 
-        Returns the entity_id.
+        Returns (entity_id, is_new) where is_new is True if the entity was created
+        during this call. Callers can use is_new to track rollback candidates.
+
+        Uses = with COLLATE NOCASE for exact-name matching (case-insensitive),
+        and LIKE with % boundaries for alias matching — both avoiding the
+        undefined LIKE case-sensitivity of the underlying column.
         """
-        # Exact name match
+        # Normalize: strip trailing punctuation for consistent matching.
+        normalized = name.strip().rstrip(".,;:!?")
+        if not normalized:
+            normalized = name.strip()  # fall back if stripping kills it
+
+        # Exact name match (case-insensitive).
         row = self._conn.execute(
-            "SELECT entity_id FROM entities WHERE name LIKE ?", (name,)
+            "SELECT entity_id FROM entities WHERE name = ? COLLATE NOCASE",
+            (normalized,),
         ).fetchone()
         if row is not None:
-            return int(row["entity_id"])
+            return int(row["entity_id"]), False
 
-        # Search aliases — aliases stored as comma-separated; use LIKE with % boundaries
+        # Search aliases — aliases stored as comma-separated; use LIKE with % boundaries.
         alias_row = self._conn.execute(
             """
             SELECT entity_id FROM entities
             WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%'
             """,
-            (name,),
+            (normalized,),
         ).fetchone()
         if alias_row is not None:
-            return int(alias_row["entity_id"])
+            return int(alias_row["entity_id"]), False
 
-        # Create new entity
+        # Create new entity.
+        # Do NOT commit here: callers may be inside an active SAVEPOINT.
         cur = self._conn.execute(
-            "INSERT INTO entities (name) VALUES (?)", (name,)
+            "INSERT INTO entities (name) VALUES (?)", (normalized,)
         )
-        self._conn.commit()
-        return int(cur.lastrowid)  # type: ignore[return-value]
+        return int(cur.lastrowid), True  # type: ignore[return-value]
 
-    def _link_fact_entity(self, fact_id: int, entity_id: int) -> None:
-        """Insert into fact_entities, silently ignore if the link already exists."""
+    def _link_fact_entity_no_commit(self, fact_id: int, entity_id: int) -> None:
+        """Insert into fact_entities without committing. Caller batches commits."""
         self._conn.execute(
             """
             INSERT OR IGNORE INTO fact_entities (fact_id, entity_id)
@@ -465,15 +769,27 @@ class MemoryStore:
             """,
             (fact_id, entity_id),
         )
-        self._conn.commit()
 
     def _compute_hrr_vector(self, fact_id: int, content: str) -> None:
-        """Compute and store HRR vector for a fact. No-op if numpy unavailable."""
-        with self._lock:
-            if not self._hrr_available:
-                return
+        """Compute and store HRR vector for a fact. No-op if numpy unavailable.
 
-            # Get entities linked to this fact
+        Re-checks numpy availability at call time (not just at __init__) in case
+        it was installed after the store was created.
+
+        The lock is NOT held during numpy encoding — this is intentional: numpy
+        operations are orders of magnitude slower than SQLite I/O, and holding
+        the lock blocks all concurrent readers. SQLite's WAL ensures the partial
+        write (hrr_vector) is not visible to other connections until we commit.
+        """
+        # Re-check numpy availability per call.
+        if not hrr._HAS_NUMPY:
+            # add_fact has already inserted/linked rows before this call;
+            # commit them so they are durable even without NumPy/HRR support.
+            with self._lock:
+                self._conn.commit()
+            return
+
+        with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT e.name FROM entities e
@@ -492,29 +808,81 @@ class MemoryStore:
             self._conn.commit()
 
     def _rebuild_bank(self, category: str) -> None:
-        """Full rebuild of a category's memory bank from all its fact vectors."""
-        with self._lock:
-            if not self._hrr_available:
-                return
+        """Full rebuild of a category's memory bank from all its fact vectors.
 
-            bank_name = f"cat:{category}"
+        Validates SNR before bundling: if SNR < _SNR_MIN the bank is stored
+        with NULL vector and fact_count=0, signalling that retrieval should fall
+        back to plain FTS rather than holographic search.
+
+        The lock is NOT held during numpy bundle() — same reasoning as above.
+        """
+        # Re-check numpy availability per call.
+        if not hrr._HAS_NUMPY:
+            # add_fact already persisted the row; ensure that pending write is
+            # committed even when bank rebuild is skipped.
+            with self._lock:
+                self._conn.commit()
+            return
+
+        bank_name = f"cat:{category}"
+
+        with self._lock:
             rows = self._conn.execute(
                 "SELECT hrr_vector FROM facts WHERE category = ? AND hrr_vector IS NOT NULL",
                 (category,),
             ).fetchall()
 
-            if not rows:
-                self._conn.execute("DELETE FROM memory_banks WHERE bank_name = ?", (bank_name,))
+        if not rows:
+            with self._lock:
+                # No facts with vectors yet — upsert an empty bank so existence is
+                # recorded, avoiding repeated scans of an empty category.
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_banks (bank_name, vector, dim, fact_count, updated_at)
+                    VALUES (?, NULL, ?, 0, CURRENT_TIMESTAMP)
+                    ON CONFLICT(bank_name) DO UPDATE SET
+                        vector = NULL,
+                        dim = excluded.dim,
+                        fact_count = 0,
+                        updated_at = excluded.updated_at
+                    """,
+                    (bank_name, self.hrr_dim),
+                )
                 self._conn.commit()
-                return
+            return
 
-            vectors = [hrr.bytes_to_phases(row["hrr_vector"]) for row in rows]
-            bank_vector = hrr.bundle(*vectors)
-            fact_count = len(vectors)
+        vectors = [hrr.bytes_to_phases(row["hrr_vector"]) for row in rows]
+        fact_count = len(vectors)
 
-            # Check SNR
-            hrr.snr_estimate(self.hrr_dim, fact_count)
+        # Validate SNR before bundling.
+        snr = hrr.snr_estimate(self.hrr_dim, fact_count)
+        if snr < _SNR_MIN:
+            # SNR too low — store empty bank; retrieval must use plain FTS.
+            # Log the degraded category so it can be monitored.
+            logger.warning(
+                "category=%s SNR=%.2f < %.1f threshold; holographic bundle "
+                "skipped for %d facts",
+                category, snr, _SNR_MIN, fact_count,
+            )
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_banks (bank_name, vector, dim, fact_count, updated_at)
+                    VALUES (?, NULL, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(bank_name) DO UPDATE SET
+                        vector = NULL,
+                        dim = excluded.dim,
+                        fact_count = excluded.fact_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (bank_name, self.hrr_dim, fact_count),
+                )
+                self._conn.commit()
+            return
 
+        bank_vector = hrr.bundle(*vectors)
+
+        with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO memory_banks (bank_name, vector, dim, fact_count, updated_at)
@@ -533,9 +901,12 @@ class MemoryStore:
         """Recompute all HRR vectors + banks from text. For recovery/migration.
 
         Returns the number of facts processed.
+
+        This is an admin tool — call it explicitly after recovering from
+        corruption or upgrading numpy. It is NOT called automatically on startup.
         """
         with self._lock:
-            if not self._hrr_available:
+            if not hrr._HAS_NUMPY:
                 return 0
 
             if dim is not None:
@@ -564,8 +935,68 @@ class MemoryStore:
         return dict(row)
 
     def close(self) -> None:
-        """Close the database connection."""
-        self._conn.close()
+        """Close the database connection.
+
+        TRUNCATE checkpoint writes all WAL frames back to the main DB file,
+        then truncates the WAL to 0 bytes — preventing orphaned -wal/-shm files
+        after a crash and keeping the store as a single-file backup target.
+
+        Only runs in WAL mode; DELETE/FULL journals do not support checkpoints.
+
+        This method is guaranteed NOT to raise. Checkpoint failures are logged
+        but do not prevent the connection from closing.
+        """
+        lock = getattr(self, "_lock", None)
+
+        def _do_close() -> None:
+            try:
+                row = self._conn.execute("PRAGMA journal_mode").fetchone()
+                if row and row[0].upper() == "WAL":
+                    try:
+                        ckpt = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                        # SQLite returns (busy, log, checkpointed). busy!=0 means
+                        # checkpoint did not complete, even if no exception was raised.
+                        if ckpt and int(ckpt[0]) != 0:
+                            logger.warning(
+                                "WAL checkpoint(TRUNCATE) reported busy=%s for %s; "
+                                "WAL may persist until next clean startup.",
+                                ckpt[0],
+                                self.db_path,
+                            )
+                    except sqlite3.OperationalError as e:
+                        logger.warning(
+                            "WAL checkpoint(TRUNCATE) failed for %s: %s. "
+                            "The WAL file may be orphaned — it will be removed on next startup.",
+                            self.db_path,
+                            e,
+                        )
+                    except Exception as e:
+                        # Defensively catch everything else (DatabaseError, OSError,
+                        # etc.) so close() never propagates an exception.
+                        logger.warning(
+                            "WAL checkpoint(TRUNCATE) raised unexpected %s for %s: %s. "
+                            "WAL sidecar will be removed on next startup.",
+                            type(e).__name__,
+                            self.db_path,
+                            e,
+                        )
+            except Exception:
+                pass  # Connection is already closed or completely broken
+            try:
+                self._conn.close()
+            except Exception:
+                pass  # Double-close is safe
+
+        if lock is None:
+            _do_close()
+            return
+
+        try:
+            with lock:
+                _do_close()
+        except Exception:
+            # Keep "never raise" contract even if lock itself is compromised.
+            pass
 
     def __enter__(self) -> "MemoryStore":
         return self

@@ -4,8 +4,8 @@ from agent.smart_model_routing import choose_cheap_model_route
 _BASE_CONFIG = {
     "enabled": True,
     "cheap_model": {
-        "provider": "openrouter",
-        "model": "google/gemini-2.5-flash",
+        "provider": "minimax",
+        "model": "MiniMax-M2.7",
     },
 }
 
@@ -18,8 +18,8 @@ def test_returns_none_when_disabled():
 def test_routes_short_simple_prompt():
     result = choose_cheap_model_route("what time is it in tokyo?", _BASE_CONFIG)
     assert result is not None
-    assert result["provider"] == "openrouter"
-    assert result["model"] == "google/gemini-2.5-flash"
+    assert result["provider"] == "minimax"
+    assert result["model"] == "MiniMax-M2.7"
     assert result["routing_reason"] == "simple_turn"
 
 
@@ -49,13 +49,13 @@ def test_resolve_turn_route_falls_back_to_primary_when_route_runtime_cannot_be_r
         "what time is it in tokyo?",
         _BASE_CONFIG,
         {
-            "model": "anthropic/claude-sonnet-4",
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
+            "model": "MiniMax-M2.7",
+            "provider": "minimax",
+            "base_url": "https://api.minimax.io/anthropic",
             "api_mode": "chat_completions",
-            "api_key": "sk-primary",
+            "api_key": "***",
         },
     )
-    assert result["model"] == "anthropic/claude-sonnet-4"
-    assert result["runtime"]["provider"] == "openrouter"
+    assert result["model"] == "MiniMax-M2.7"
+    assert result["runtime"]["provider"] == "minimax"
     assert result["label"] is None
