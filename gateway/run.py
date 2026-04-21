@@ -2476,6 +2476,27 @@ class GatewayRunner:
                 _mem_mb, len(_active_sessions), _exit_type, _exit_ok,
             )
 
+            # ── Run fact_backup.sh before gateway exits ────────────────────────
+            # Checkpoints WAL, archives DB+WAL+SHM+JSON snapshot, prunes old backups.
+            # This ensures timestamped archives exist even if gateway crashes after this point.
+            try:
+                import subprocess as _subprocess
+                _backup_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "fact_backup.sh"
+                if _backup_script.exists():
+                    _result = _subprocess.run(
+                        ["/bin/bash", str(_backup_script)],
+                        capture_output=True, text=True, timeout=120,
+                        env={**os.environ, "HERMES_HOME": str(_hermes_home)},
+                    )
+                    if _result.returncode == 0:
+                        logger.info("fact_backup.sh completed: %s", _result.stdout.strip()[:200])
+                    else:
+                        logger.warning("fact_backup.sh exit %d: %s", _result.returncode, _result.stderr.strip()[:200])
+                else:
+                    logger.debug("fact_backup.sh not found at %s — skipping backup", _backup_script)
+            except Exception as e:
+                logger.warning("fact_backup.sh invocation failed (non-fatal): %s", e)
+
         self._stop_task = asyncio.create_task(_stop_impl())
         await self._stop_task
     

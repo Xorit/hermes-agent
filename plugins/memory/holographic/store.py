@@ -358,10 +358,23 @@ class MemoryStore:
             from hermes_constants import get_hermes_home
             snap_path = Path(str(get_hermes_home())) / "memory" / "memory_store_snapshot.json"
             snap_path.parent.mkdir(parents=True, exist_ok=True)
-            facts = [dict(r) for r in self._conn.execute(
-                "SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, created_at, updated_at FROM facts ORDER BY fact_id"
-            ).fetchall()]
-            snapshot = {"version": 1, "timestamp": datetime.now().isoformat(), "facts": facts}
+            rows = self._conn.execute(
+                "SELECT fact_id, content, category, tags, trust_score, "
+                "retrieval_count, helpful_count, created_at, updated_at, hrr_vector "
+                "FROM facts ORDER BY fact_id"
+            ).fetchall()
+            # Convert BLOB hrr_vector to hex for JSON serialization
+            facts = []
+            for r in rows:
+                d = dict(r)
+                if d.get("hrr_vector") is not None:
+                    d["hrr_vector"] = bytes(d["hrr_vector"]).hex()
+                facts.append(d)
+            snapshot = {
+                "version": 2,
+                "timestamp": datetime.now().isoformat(),
+                "facts": facts,
+            }
             tmp = snap_path.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, default=str)

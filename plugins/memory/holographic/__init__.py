@@ -621,7 +621,8 @@ class HolographicMemoryProvider(MemoryProvider):
             with self._store._lock:
                 facts = conn.execute(
                     "SELECT fact_id, content, category, tags, trust_score, "
-                    "       retrieval_count, helpful_count, created_at, updated_at "
+                    "       retrieval_count, helpful_count, created_at, updated_at, "
+                    "       hrr_vector "
                     "FROM facts ORDER BY fact_id"
                 ).fetchall()
                 entities = conn.execute(
@@ -632,11 +633,19 @@ class HolographicMemoryProvider(MemoryProvider):
                     "SELECT fact_id, entity_id FROM fact_entities"
                 ).fetchall()
 
+            # Convert BLOB hrr_vector to hex string for JSON serialization
+            facts_list = []
+            for r in facts:
+                d = dict(r)
+                if d.get("hrr_vector") is not None:
+                    d["hrr_vector"] = bytes(d["hrr_vector"]).hex()
+                facts_list.append(d)
+
             snapshot = {
-                "version": 1,
+                "version": 2,
                 "timestamp": datetime.now().isoformat(),
                 "db_path": str(self._store.db_path),
-                "facts": [dict(r) for r in facts],
+                "facts": facts_list,
                 "entities": [dict(r) for r in entities],
                 "fact_entities": [dict(r) for r in fact_entities],
                 "counts": {
