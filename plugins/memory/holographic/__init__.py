@@ -164,26 +164,17 @@ class HolographicMemoryProvider(MemoryProvider):
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        # Idempotent: keep existing store if it's still healthy.
-        # Closing and recreating on every session start causes WAL replay issues
-        # and "file is not a database" cascading failures (see Apr 21 incident).
-        if self._store is not None:
-            try:
-                with self._store._lock:
-                    self._store._conn.execute("SELECT 1").fetchone()
-                # Store is healthy — just update session_id and reuse.
-                self._session_id = session_id
-                return
-            except Exception:
-                logger = logging.getLogger(__name__)
-                logger.warning("holographic: existing store unhealthy, reinitializing")
-                try:
-                    self._store.close()
-                except Exception:
-                    pass
-                self._store = None
-                self._retriever = None
-
+        # Singleton store: MemoryStore.acquire() returns the same instance for
+        # the same db_path across all sessions. Reference counting ensures the
+        # store is only closed when the last session releases it.
+        #
+        # Old behaviour (new MemoryStore() each time) caused:
+        # - Every session triggered startup integrity check
+        # - Every session started a new backup thread
+        # - Slow shutdown (pile-up of close() calls)
+        # - SIGKILL → DB corruption → 64 KB reset cycle
+        #
+        # Fix: use acquire() — one store, one backup thread, clean shutdown.
         import logging
         logger = logging.getLogger(__name__)
 
@@ -205,7 +196,7 @@ class HolographicMemoryProvider(MemoryProvider):
             jaccard_weight = float(self._config.get("jaccard_weight", 0.3))
             temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
-            self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
+            self._store = MemoryStore.acquire(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
             self._retriever = FactRetriever(
                 store=self._store,
                 temporal_decay_half_life=temporal_decay,
@@ -216,7 +207,9 @@ class HolographicMemoryProvider(MemoryProvider):
             )
             self._session_id = session_id
 
-            # Start periodic online backup thread (every 5 minutes)
+            # Start periodic online backup thread (every 5 minutes).
+            # With singleton, this only starts once — on the first session.
+            # Subsequent sessions hit the "already running" guard in start_online_backup().
             try:
                 self._store.start_online_backup(interval=300)
             except Exception as exc:
@@ -433,9 +426,9 @@ class HolographicMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         if self._store is not None:
             try:
-                self._store.close()
+                self._store.release()  # decrements refcount; actually closes when last session releases
             except Exception as exc:
-                logger.debug("HolographicMemoryProvider.close() raised during shutdown: %s", exc)
+                logger.debug("HolographicMemoryProvider.shutdown() raised: %s", exc)
         self._store = None
         self._retriever = None
 
