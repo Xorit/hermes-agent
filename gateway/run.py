@@ -1750,6 +1750,14 @@ class GatewayRunner:
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
+        active = self._running_agent_count()
+        if active > 0:
+            logger.warning(
+                "Restart denied: %d active session(s) still running. "
+                "Wait for sessions to complete or use /cancel first.",
+                active,
+            )
+            return False
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
@@ -2476,26 +2484,51 @@ class GatewayRunner:
                 _mem_mb, len(_active_sessions), _exit_type, _exit_ok,
             )
 
-            # ── Run fact_backup.sh before gateway exits ────────────────────────
-            # Checkpoints WAL, archives DB+WAL+SHM+JSON snapshot, prunes old backups.
-            # This ensures timestamped archives exist even if gateway crashes after this point.
+            # ── Run fact_backup.sh before gateway exits (awaited, not fire-and-forget) ──
+            # This ensures the backup completes before the gateway process exits.
+            # Runs after all sessions are drained and all agents are finalized.
+            # Timeout is enforced — if backup hangs, gateway still exits cleanly.
             try:
-                import subprocess as _subprocess
                 _backup_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "fact_backup.sh"
                 if _backup_script.exists():
-                    _result = _subprocess.run(
-                        ["/bin/bash", str(_backup_script)],
-                        capture_output=True, text=True, timeout=120,
-                        env={**os.environ, "HERMES_HOME": str(_hermes_home)},
+                    _cmd = f"HERMES_HOME={_hermes_home} /bin/bash {str(_backup_script)}"
+                    _proc = await asyncio.create_subprocess_shell(
+                        _cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
-                    if _result.returncode == 0:
-                        logger.info("fact_backup.sh completed: %s", _result.stdout.strip()[:200])
+                    try:
+                        _stdout, _stderr = await asyncio.wait_for(
+                            _proc.communicate(), timeout=120
+                        )
+                    except asyncio.TimeoutError:
+                        _proc.kill()
+                        await _proc.wait()
+                        logger.warning(
+                            "fact_backup.sh timed out after 120s — "
+                            "gateway exit proceeds without backup."
+                        )
                     else:
-                        logger.warning("fact_backup.sh exit %d: %s", _result.returncode, _result.stderr.strip()[:200])
+                        if _proc.returncode == 0:
+                            logger.info(
+                                "fact_backup.sh completed: %s",
+                                _stdout.decode().strip()[:200],
+                            )
+                        else:
+                            logger.warning(
+                                "fact_backup.sh exit %d: %s",
+                                _proc.returncode,
+                                _stderr.decode().strip()[:200],
+                            )
                 else:
-                    logger.debug("fact_backup.sh not found at %s — skipping backup", _backup_script)
+                    logger.debug(
+                        "fact_backup.sh not found at %s — skipping backup",
+                        _backup_script,
+                    )
             except Exception as e:
-                logger.warning("fact_backup.sh invocation failed (non-fatal): %s", e)
+                logger.warning(
+                    "fact_backup.sh invocation failed (non-fatal): %s", e
+                )
 
         self._stop_task = asyncio.create_task(_stop_impl())
         await self._stop_task
@@ -10126,6 +10159,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
+    # Honor any exit_code set by _stop_impl (e.g. GATEWAY_SERVICE_RESTART_EXIT_CODE=75
+    # for planned service restarts).  This must be checked before the
+    # signal-initiated path below, otherwise _exit_code=75 is never reached.
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
 
