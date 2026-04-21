@@ -289,64 +289,41 @@ class MemoryStore:
 
         logger.warning(
             "holographic memory_store integrity check failed after WAL replay. "
-            "Previous shutdown was dirty — deleting orphaned WAL/SHM files "
-            "and re-opening. Some recent facts may be lost.",
+            "Archiving DB and starting fresh — facts may be recoverable from backup archives.",
         )
 
-        # Close and delete the orphaned WAL/SHM.
-        # We close the connection directly (skipping checkpoint) since
-        # integrity already failed — the WAL is untrustworthy anyway.
+        # Close connection and archive the DB (never silently delete).
         try:
             self._conn.close()
         except Exception:
             pass
 
+        import time as _time
+        _ts = int(_time.time())
+        _archive = self.db_path.parent / (self.db_path.name + f".corrupted.{_ts}")
+        try:
+            logger.info("holographic: archiving %s → %s", self.db_path, _archive)
+            self.db_path.rename(_archive)
+        except FileNotFoundError:
+            pass  # Already gone — no action needed
+        except OSError as exc:
+            logger.warning("holographic: could not archive corrupt DB: %s", exc)
+
+        # Archive orphaned WAL/SHM sidecars too
         wal_path, shm_path = _wal_sidecar_paths(self.db_path)
         for path in (wal_path, shm_path):
             try:
                 if path.exists():
-                    path.unlink()
-                    logger.info("Deleted orphaned WAL segment: %s", path)
+                    _sidecar_archive = path.parent / (path.name + f".corrupted.{_ts}")
+                    logger.info("holographic: archiving orphaned sidecar %s → %s", path, _sidecar_archive)
+                    path.rename(_sidecar_archive)
             except Exception as exc:
-                logger.warning("Could not delete %s: %s", path, exc)
+                logger.warning("holographic: could not archive sidecar %s: %s", path, exc)
 
-        # Re-open on the clean DB (WAL mode will be re-established by _init_db).
-        # If anything goes wrong here, archive the DB and create a fresh one.
-        # We NEVER silently delete — always rename to .corrupted.TIMESTAMP for recovery.
-        try:
-            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._init_db()
-        except sqlite3.DatabaseError as exc:
-            if not _is_known_corruption_error(exc):
-                raise
-            import time as _time
-            logger.warning(
-                "holographic: reconnect+init failed (%s) — archiving DB and starting fresh. "
-                "Corrupted file preserved for recovery. Facts may be restored from JSON snapshot.",
-                exc,
-            )
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            # Archive the corrupted file instead of deleting it
-            try:
-                _ts = int(_time.time())
-                _archive = self.db_path.parent / (self.db_path.name + f".corrupted.{_ts}")
-                logger.info("holographic: archiving %s → %s", self.db_path, _archive)
-                self.db_path.rename(_archive)
-            except (FileNotFoundError, OSError):
-                pass
-            wal_path, shm_path = _wal_sidecar_paths(self.db_path)
-            for path in (wal_path, shm_path):
-                try:
-                    path.unlink(missing_ok=True)
-                except FileNotFoundError:
-                    pass
-            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._init_db()
+        # Open fresh DB (WAL mode will be re-established by _init_db).
+        self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_db()
         logger.info("holographic memory_store re-opened after WAL recovery.")
 
     def _try_snapshot(self) -> None:
