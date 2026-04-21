@@ -290,14 +290,14 @@ class TestJSONSnapshot:
         print(f"  entities: {len(entities)}, fact_entities: {len(fact_entities)}, facts: {facts_count}")
 
     def test_snapshot_json_format(self, memory_store):
-        """Snapshot produces a valid JSON structure."""
+        """Snapshot produces a valid v2 JSON structure with hrr_vector as hex."""
         memory_store.add_fact("format test fact alpha", category="general")
         memory_store.add_fact("format test fact beta", category="user_pref",
                               tags="test")
         
-        # Build snapshot exactly as _snapshot_facts_to_json does
+        # Build snapshot exactly as the fixed _snapshot_facts_to_json does
         with memory_store._lock:
-            facts = memory_store._conn.execute(
+            rows = memory_store._conn.execute(
                 "SELECT fact_id, content, category, tags, trust_score, "
                 "       retrieval_count, helpful_count, created_at, updated_at, "
                 "       hrr_vector "
@@ -311,15 +311,23 @@ class TestJSONSnapshot:
                 "SELECT fact_id, entity_id FROM fact_entities"
             ).fetchall()
         
+        # Convert BLOB hrr_vector to hex (as the fixed code does)
+        facts_list = []
+        for r in rows:
+            d = dict(r)
+            if d.get("hrr_vector") is not None:
+                d["hrr_vector"] = bytes(d["hrr_vector"]).hex()
+            facts_list.append(d)
+        
         snapshot = {
-            "version": 1,
+            "version": 2,
             "timestamp": "2026-04-21T00:00:00",
             "db_path": str(memory_store.db_path),
-            "facts": [dict(r) for r in facts],
+            "facts": facts_list,
             "entities": [dict(r) for r in entities],
             "fact_entities": [dict(r) for r in fact_entities],
             "counts": {
-                "facts": len(facts),
+                "facts": len(rows),
                 "entities": len(entities),
                 "fact_entities": len(fact_entities),
             },
@@ -433,7 +441,7 @@ class TestSessionState:
         assert session["model"] == "test-model"
 
     def test_end_session_idempotent(self, state_db):
-        """Calling end_session twice should not overwrite first end_reason."""
+        """Calling end_session twice should not overwrite first end_reason (WHERE ended_at IS NULL guard)."""
         sid = _random_session_id()
         state_db.create_session(session_id=sid, source="cli", model="test-model")
         
@@ -441,14 +449,12 @@ class TestSessionState:
         session = state_db.get_session(sid)
         assert session["end_reason"] == "user_exit"
         
-        # Second end — should be no-op if WHERE ended_at IS NULL guard exists
+        # Second end with different reason — should be NO-OP (first wins)
         state_db.end_session(sid, "compression")
         session = state_db.get_session(sid)
         
-        # Document the behavior (either is acceptable, but guard is preferred)
-        print(f"  end_reason after double-end: {session['end_reason']}")
-        # If guard exists: "user_exit", if not: "compression"
-        assert session["end_reason"] in ("user_exit", "compression")
+        assert session["end_reason"] == "user_exit", \
+            "WHERE ended_at IS NULL guard should prevent overwriting first end_reason"
 
     def test_update_token_counts_accumulates(self, state_db):
         """Token counts are correctly accumulated."""
