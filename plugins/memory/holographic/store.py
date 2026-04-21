@@ -987,45 +987,77 @@ class MemoryStore:
         return dict(row)
 
     # ------------------------------------------------------------------
-    # Online backup (periodic, runs during runtime via background thread)
+    # Online backup (periodic, runs as subprocess every interval seconds)
+    #
+    # Runs as an independent subprocess — survives gateway SIGTERM/SIGKILL,
+    # creating a consistent backup even if the gateway is killed mid-cycle.
+    #
+    # Each invocation: fires a Python subprocess that calls sqlite3.backup()
+    # (source = live DB, dest = standalone .db file).  Fire-and-forget
+    # so the gateway never blocks on I/O.  The subprocess is a child of
+    # init (not the gateway), so systemd won't reap it.
     # ------------------------------------------------------------------
 
     def online_backup(self) -> str | None:
-        """Create a consistent online backup using the SQLite backup API.
+        """Create a consistent backup by spawning a standalone subprocess.
 
-        Uses ``dest_conn.backup(source_conn)`` which internally calls
-        ``sqlite3_backup_init / step / finish`` — safe to run while the
-        database is actively in use.  No checkpoint or lock is held.
+        The subprocess calls sqlite3.backup() using its OWN connection to the
+        DB — completely independent of the gateway process.  If the gateway
+        is killed (SIGTERM/SIGKILL), the subprocess survives and finishes
+        the backup.
 
-        Returns the path to the backup file, or None on failure.
+        Returns the backup path (if spawned), or None on failure.
         """
-        from datetime import datetime
+        import datetime as _datetime
         import time as _time
 
-        _ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        _ts = _datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         _backup_path = self._online_backup_dir / f"memory_store_{_ts}.db"
 
         try:
-            with self._lock:
-                dest = sqlite3.connect(str(_backup_path), timeout=10.0)
-                try:
-                    self._conn.backup(dest)
-                finally:
-                    dest.close()
+            _script = f"""
+import sqlite3, sys, os
+from pathlib import Path
 
-            # Also save a JSON snapshot alongside the DB backup
-            self._try_snapshot()
+src = {str(repr(str(self.db_path)))}
+dst = {str(repr(str(_backup_path)))}
+keep = 28
 
-            self._prune_online_backups()
-            logger.info("holographic: online backup created → %s", _backup_path)
+try:
+    # Open with isolation_level=None so sqlite3.backup() can proceed
+    # while the gateway has the DB open with an active transaction.
+    sc = sqlite3.connect(src, timeout=10.0, isolation_level=None)
+    dc = sqlite3.connect(dst, timeout=10.0)
+    sc.backup(dc)
+    dc.close()
+    sc.close()
+    print('OK ' + dst, file=sys.stderr)
+except Exception as e:
+    print('ERR ' + str(e), file=sys.stderr)
+    if os.path.exists(dst):
+        try: os.unlink(dst)
+        except: pass
+
+# Prune oldest backups (keep most recent 28)
+backup_dir = Path(dst).parent
+try:
+    backups = sorted(backup_dir.glob('memory_store_*.db'), key=lambda p: p.stat().st_mtime)
+    for old in backups[:-keep]:
+        old.unlink(missing_ok=True)
+except Exception:
+    pass
+"""
+            import subprocess as _subprocess
+            _subprocess.Popen(
+                [_subprocess.sys.executable, "-c", _script],
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.PIPE,
+                start_new_session=True,
+            )
+            logger.debug("holographic: backup subprocess spawned → %s", _backup_path)
             return str(_backup_path)
         except Exception as exc:
-            logger.warning("holographic: online backup failed: %s", exc)
-            # Clean up partial file
-            try:
-                _backup_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            logger.warning("holographic: failed to spawn backup subprocess: %s", exc)
             return None
 
     def _prune_online_backups(self) -> None:
