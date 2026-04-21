@@ -1051,7 +1051,7 @@ except Exception:
             _subprocess.Popen(
                 [_subprocess.sys.executable, "-c", _script],
                 stdout=_subprocess.DEVNULL,
-                stderr=_subprocess.PIPE,
+                stderr=_subprocess.DEVNULL,
                 start_new_session=True,
             )
             logger.debug("holographic: backup subprocess spawned → %s", _backup_path)
