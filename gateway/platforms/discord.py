@@ -1049,7 +1049,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     duration_secs = max(1.0, len(file_data) / 2000.0)
 
                 waveform_bytes = bytes([128] * 256)
-                waveform_b64 = base64.b64encode(waveform_bytes).decode()
+                waveform_b64 = base64.b64encode(waveform_bytes).decode("ascii")
 
                 import json as _json
                 payload = _json.dumps({
@@ -2958,15 +2958,19 @@ class DiscordAdapter(BasePlatformAdapter):
                             if ext in (".md", ".txt", ".log") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                                 try:
                                     text_content = raw_bytes.decode("utf-8")
-                                    display_name = att.filename or f"document{ext}"
-                                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                                    injection = f"[Content of {display_name}]:\n{text_content}"
-                                    if pending_text_injection:
-                                        pending_text_injection = f"{pending_text_injection}\n\n{injection}"
-                                    else:
-                                        pending_text_injection = injection
                                 except UnicodeDecodeError:
-                                    pass
+                                    text_content = raw_bytes.decode("utf-8", errors="replace")
+                                    logger.warning(
+                                        "[Discord] UTF-8 decode error for text file; using replacement characters",
+                                        exc_info=True,
+                                    )
+                                display_name = att.filename or f"document{ext}"
+                                display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                                injection = f"[Content of {display_name}]:\n{text_content}"
+                                if pending_text_injection:
+                                    pending_text_injection = f"{pending_text_injection}\n\n{injection}"
+                                else:
+                                    pending_text_injection = injection
                         except Exception as e:
                             logger.warning(
                                 "[Discord] Failed to cache document %s: %s",
@@ -3244,7 +3248,7 @@ if DISCORD_AVAILABLE:
                 home = get_hermes_home()
                 response_path = home / ".update_response"
                 tmp = response_path.with_suffix(".tmp")
-                tmp.write_text(answer)
+                tmp.write_text(answer, encoding="utf-8")
                 tmp.replace(response_path)
                 logger.info(
                     "Discord update prompt answered '%s' by %s",

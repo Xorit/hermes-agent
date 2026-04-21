@@ -333,9 +333,41 @@ def show_status(args):
             status += f" (home: {home_channel})"
         
         print(f"  {name:<12}  {check_mark(has_token)} {status}")
-    
+
     # =========================================================================
-    # Gateway Status
+    # Memory Provider
+    # =========================================================================
+    print()
+    print(color("◆ Memory Provider", Colors.CYAN, Colors.BOLD))
+
+    memory_cfg = config.get("memory", {})
+    provider = memory_cfg.get("provider", "built-in")
+    enabled = memory_cfg.get("memory_enabled", True)
+
+    print(f"  Provider:     {provider}")
+    print(f"  Enabled:      {check_mark(enabled)}")
+
+    if provider == "holographic":
+        h_cfg = config.get("plugins", {}).get("hermes-memory-store", {})
+        db_path_raw = h_cfg.get("db_path")
+        if db_path_raw:
+            db_path = Path(db_path_raw).expanduser()
+            if db_path.exists():
+                size_kb = db_path.stat().st_size / 1024
+                print(f"  Database:     {check_mark(True)} {db_path.name} ({size_kb:.1f} KB)")
+
+                # Sidecar check
+                wal_path = Path(str(db_path) + "-wal")
+                if wal_path.exists():
+                    wal_size = wal_path.stat().st_size / 1024
+                    print(f"    ↳ Status:   Active WAL ({wal_size:.1f} KB)")
+                else:
+                    print(f"    ↳ Status:   Clean (No WAL)")
+            else:
+                print(f"  Database:     {check_mark(False)} {db_path.name} (not found)")
+
+    # =========================================================================
+    # Gateway Service
     # =========================================================================
     print()
     print(color("◆ Gateway Service", Colors.CYAN, Colors.BOLD))

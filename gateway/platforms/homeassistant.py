@@ -78,6 +78,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         url = extra.get("url") or os.getenv("HASS_URL", "http://homeassistant.local:8123")
         self._hass_url: str = url.rstrip("/")
         self._hass_token: str = token
+        self._respond_to_ha_events: bool = bool(extra.get("respond_to_ha_events", True))
 
         # Event filtering
         self._watch_domains: Set[str] = set(extra.get("watch_domains", []))
@@ -271,6 +272,12 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         if entity_id in self._ignore_entities:
             return
 
+        # Ignore Home Assistant persistent notifications to avoid Hermes
+        # consuming its own outbound notification messages.
+        domain = entity_id.split(".")[0] if "." in entity_id else ""
+        if domain == "persistent_notification":
+            return
+
         # Apply domain/entity watch filters (closed by default — require
         # explicit watch_domains, watch_entities, or watch_all to forward)
         domain = entity_id.split(".")[0] if "." in entity_id else ""
@@ -395,6 +402,9 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         Uses the REST API instead of WebSocket to avoid a race condition
         with the event listener loop that reads from the same WS connection.
         """
+        if not self._respond_to_ha_events:
+            return SendResult(success=True)
+
         url = f"{self._hass_url}/api/services/persistent_notification/create"
         headers = {
             "Authorization": f"Bearer {self._hass_token}",

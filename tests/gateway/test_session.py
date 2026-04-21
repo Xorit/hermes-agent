@@ -470,6 +470,60 @@ class TestLoadTranscriptCorruptLines:
         assert messages[0]["content"] == "a"
         assert messages[1]["content"] == "b"
 
+    def test_invalid_utf8_bytes_skipped(self, store, tmp_path):
+        """Regression: binary garbage (invalid UTF-8) in transcript must not crash
+        load_transcript. The loader retries with errors='replace' and skips
+        unparseable lines."""
+        session_id = "utf8_corrupt"
+        transcript_path = store.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        # Valid JSONL, then raw binary bytes, then more valid JSONL
+        with open(transcript_path, "wb") as f:
+            f.write(b'{"role": "user", "content": "hello"}\n')
+            f.write(b'\x80\x81\xfe\xff\n')  # invalid UTF-8 continuation bytes
+            f.write(b'{"role": "assistant", "content": "world"}\n')
+
+        messages = store.load_transcript(session_id)
+        assert len(messages) == 2
+        assert messages[0]["content"] == "hello"
+        assert messages[1]["content"] == "world"
+
+    def test_binary_garbage_embedded_in_jsonl(self, store, tmp_path):
+        """Regression: binary garbage mixed with valid JSONL must be skipped,
+        not poison the entire file parse."""
+        session_id = "mixed_binary"
+        transcript_path = store.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(transcript_path, "wb") as f:
+            f.write(b'{"role": "user", "content": "first"}\n')
+            f.write(b'\xc0\xc1\xc2 garbage here\n')
+            f.write(b'{"role": "assistant", "content": "after"}\n')
+
+        messages = store.load_transcript(session_id)
+        assert len(messages) == 2
+        assert messages[0]["content"] == "first"
+        assert messages[1]["content"] == "after"
+
+    def test_empty_transcript_returns_empty_list(self, store, tmp_path):
+        """Regression: zero-byte transcript must not crash."""
+        session_id = "empty_transcript"
+        transcript_path = store.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_bytes(b"")
+
+        messages = store.load_transcript(session_id)
+        assert messages == []
+
+    def test_all_lines_have_invalid_utf8(self, store, tmp_path):
+        """Regression: if every line is binary garbage, load_transcript returns []."""
+        session_id = "all_binary"
+        transcript_path = store.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_bytes(b'\xc0\xc1\xc2\n\xfe\xff\x00\n')
+
+        messages = store.load_transcript(session_id)
+        assert messages == []
+
 
 class TestLoadTranscriptPreferLongerSource:
     """Regression: load_transcript must return whichever source (SQLite or JSONL)

@@ -323,6 +323,9 @@ class HolographicMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("[memory] Contradiction check failed: %s", e)
 
+        # Phase 3: snapshot facts to JSON for disaster recovery
+        self._snapshot_facts_to_json()
+
     def on_memory_write(
         self, action: str, target: str, content: str, *, new_content: str | None = None
     ) -> None:
@@ -340,15 +343,16 @@ class HolographicMemoryProvider(MemoryProvider):
 
             if action == "add":
                 self._store.add_fact(content, category=category)
+                self._snapshot_facts_to_json()
 
             elif action == "remove":
-                conn = self._store._conn
-                rows = conn.execute(
+                rows = self._store._conn.execute(
                     "SELECT fact_id FROM facts WHERE content LIKE ?",
                     (f"%{content}%",),
                 ).fetchall()
                 for row in rows:
                     self._store.remove_fact(row["fact_id"])
+                self._snapshot_facts_to_json()
 
             elif action == "replace":
                 if not new_content or not str(new_content).strip():
@@ -404,6 +408,8 @@ class HolographicMemoryProvider(MemoryProvider):
                     for affected_category in affected_categories:
                         self._store._rebuild_bank(affected_category)
 
+                self._snapshot_facts_to_json()
+
         except Exception as e:
             logger.debug("Holographic memory_write mirror failed: %s", e)
 
@@ -432,6 +438,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
                 )
+                self._snapshot_facts_to_json()
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
             elif action == "search":
@@ -472,6 +479,7 @@ class HolographicMemoryProvider(MemoryProvider):
 
             elif action == "contradict":
                 results = retriever.contradict(
+                    entity=args.get("entity"),
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
                 )
@@ -485,10 +493,12 @@ class HolographicMemoryProvider(MemoryProvider):
                     tags=args.get("tags"),
                     category=args.get("category"),
                 )
+                self._snapshot_facts_to_json()
                 return json.dumps({"updated": updated})
 
             elif action == "remove":
                 removed = store.remove_fact(int(args["fact_id"]))
+                self._snapshot_facts_to_json()
                 return json.dumps({"removed": removed})
 
             elif action == "list":
@@ -563,6 +573,79 @@ class HolographicMemoryProvider(MemoryProvider):
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)
+
+    def _snapshot_facts_to_json(self) -> None:
+        """Snapshot all facts, entities, and fact_entities to a JSON recovery file.
+
+        Called on every significant write (add/remove) and at session end.
+        This is the primary disaster-recovery mechanism — if the SQLite DB is
+        corrupted or lost, facts can be restored from this JSON using the
+        /root/.hermes/scripts/fact_backup.sh restore command or a simple
+        Python script reading the JSON.
+
+        The snapshot is stored at:
+          $HERMES_HOME/memory/memory_store_snapshot.json
+
+        A timestamped copy is NOT written per-snapshot (that is handled by the
+        cron-triggered fact_backup.sh which also snapshots DB+WAL+SHM). This
+        method focuses on always having a current recovery file.
+        """
+        import json
+        from datetime import datetime
+        from pathlib import Path
+
+        if not self._store:
+            return
+
+        try:
+            from hermes_constants import get_hermes_home
+            snap_base = get_hermes_home() / "memory"
+            snap_base.mkdir(parents=True, exist_ok=True)
+            snap_path = snap_base / "memory_store_snapshot.json"
+        except Exception:
+            return
+
+        try:
+            conn = self._store._conn
+            with self._store._lock:
+                facts = conn.execute(
+                    "SELECT fact_id, content, category, tags, trust_score, "
+                    "       retrieval_count, helpful_count, created_at, updated_at "
+                    "FROM facts ORDER BY fact_id"
+                ).fetchall()
+                entities = conn.execute(
+                    "SELECT entity_id, name, entity_type, aliases, created_at "
+                    "FROM entities ORDER BY entity_id"
+                ).fetchall()
+                fact_entities = conn.execute(
+                    "SELECT fact_id, entity_id FROM fact_entities"
+                ).fetchall()
+
+            snapshot = {
+                "version": 1,
+                "timestamp": datetime.now().isoformat(),
+                "db_path": str(self._store.db_path),
+                "facts": [dict(r) for r in facts],
+                "entities": [dict(r) for r in entities],
+                "fact_entities": [dict(r) for r in fact_entities],
+                "counts": {
+                    "facts": len(facts),
+                    "entities": len(entities),
+                    "fact_entities": len(fact_entities),
+                },
+            }
+
+            # Atomic write: write to .tmp then rename
+            tmp_path = snap_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2, default=str)
+            tmp_path.replace(snap_path)
+            logger.debug(
+                "holographic: snapshot saved (%d facts, %d entities) -> %s",
+                len(facts), len(entities), snap_path,
+            )
+        except Exception as e:
+            logger.debug("holographic: snapshot failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

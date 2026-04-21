@@ -12,6 +12,8 @@ import hashlib
 import logging
 import os
 import json
+import stat
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -25,6 +27,40 @@ logger = logging.getLogger(__name__)
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()
+
+
+# ---------------------------------------------------------------------------
+# Atomic file write helper
+# ---------------------------------------------------------------------------
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text to path atomically: temp file + fsync + rename.
+
+    Avoids mid-write crashes leaving corrupted partial files behind.
+    The temporary file is created in the same directory as the target
+    to ensure the rename stays on the same filesystem.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # Atomic rename; sets permissions to default umask
+        os.replace(tmp_path, path)
+    except BaseException:
+        # Clean up temp file on any failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1003,11 +1039,10 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
         
-        # JSONL: overwrite the file
+        # JSONL: overwrite the file atomically
         transcript_path = self.get_transcript_path(session_id)
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        content = "".join(json.dumps(msg, ensure_ascii=False) + "\n" for msg in messages)
+        _atomic_write_text(transcript_path, content)
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
@@ -1023,18 +1058,62 @@ class SessionStore:
         # for sessions created before the DB layer was introduced).
         transcript_path = self.get_transcript_path(session_id)
         jsonl_messages = []
+
+        def _append_parsed_line(raw_line: str, line_no: int) -> None:
+            line = raw_line.strip()
+            if not line:
+                return
+
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                # Best-effort salvage for corrupted entries (e.g. stray NULs,
+                # binary bytes replaced with U+FFFD, or control characters).
+                cleaned = line.replace("\x00", "")
+                cleaned = "".join(
+                    ch for ch in cleaned
+                    if ch == "\t" or ord(ch) >= 0x20
+                )
+                if cleaned and cleaned != line:
+                    try:
+                        parsed = json.loads(cleaned)
+                    except json.JSONDecodeError:
+                        parsed = None
+                else:
+                    parsed = None
+
+                if parsed is None:
+                    logger.warning(
+                        "Skipping corrupt line %d in transcript %s: %s",
+                        line_no,
+                        session_id,
+                        line[:120],
+                    )
+                    return
+
+            if isinstance(parsed, dict):
+                jsonl_messages.append(parsed)
+            else:
+                logger.warning(
+                    "Skipping non-object entry at line %d in transcript %s",
+                    line_no,
+                    session_id,
+                )
+
         if transcript_path.exists():
-            with open(transcript_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            jsonl_messages.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                "Skipping corrupt line in transcript %s: %s",
-                                session_id, line[:120],
-                            )
+            try:
+                with open(transcript_path, "r", encoding="utf-8") as f:
+                    for line_no, raw_line in enumerate(f, start=1):
+                        _append_parsed_line(raw_line, line_no)
+            except UnicodeDecodeError as e:
+                logger.warning(
+                    "Transcript %s is not valid UTF-8 (%s); retrying with replacement decoding",
+                    transcript_path,
+                    e,
+                )
+                with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line_no, raw_line in enumerate(f, start=1):
+                        _append_parsed_line(raw_line, line_no)
 
         # Prefer whichever source has more messages.
         #

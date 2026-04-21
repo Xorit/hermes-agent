@@ -83,7 +83,10 @@ class WXBizMsgCrypt:
 
     def verify_url(self, msg_signature: str, timestamp: str, nonce: str, echostr: str) -> str:
         plain = self.decrypt(msg_signature, timestamp, nonce, echostr)
-        return plain.decode("utf-8")
+        try:
+            return plain.decode("utf-8")
+        except UnicodeDecodeError:
+            return plain.decode("utf-8", errors="replace")
 
     def decrypt(self, msg_signature: str, timestamp: str, nonce: str, encrypt: str) -> bytes:
         expected = _sha1_signature(self.token, timestamp, nonce, encrypt)

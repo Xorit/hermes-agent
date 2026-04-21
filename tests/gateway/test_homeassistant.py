@@ -231,6 +231,14 @@ class TestAdapterInit:
         adapter = HomeAssistantAdapter(config)
         assert adapter._watch_all is True
 
+    def test_respond_to_ha_events_parsed(self):
+        config = PlatformConfig(
+            enabled=True, token="***",
+            extra={"respond_to_ha_events": False},
+        )
+        adapter = HomeAssistantAdapter(config)
+        assert adapter._respond_to_ha_events is False
+
     def test_defaults_when_no_extra(self, monkeypatch):
         monkeypatch.setenv("HASS_TOKEN", "tok")
         config = PlatformConfig(enabled=True, token="***")
@@ -320,6 +328,19 @@ class TestEventFilteringPipeline:
         adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
         await adapter._handle_ha_event(_make_event("cover.blinds", "closed", "open"))
         adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_persistent_notification_entity_not_forwarded_even_with_watch_all(self):
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
+        await adapter._handle_ha_event(
+            _make_event(
+                "persistent_notification.hermes_agent",
+                "old",
+                "new",
+                new_attrs={"friendly_name": "Hermes Agent"},
+            )
+        )
+        adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_same_state_not_forwarded(self):
@@ -517,6 +538,17 @@ class TestSendViaRestApi:
         assert call_args[1]["json"]["title"] == "Hermes Agent"
         assert call_args[1]["json"]["message"] == "Test notification"
         assert "Bearer tok" in call_args[1]["headers"]["Authorization"]
+
+    @pytest.mark.asyncio
+    async def test_send_noops_when_ha_responses_disabled(self):
+        adapter = _make_adapter(respond_to_ha_events=False)
+
+        with patch("gateway.platforms.homeassistant.aiohttp") as mock_aiohttp:
+            result = await adapter.send("ha_events", "Test notification")
+
+        assert result.success is True
+        assert result.message_id is None
+        mock_aiohttp.ClientSession.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_http_error(self):

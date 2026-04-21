@@ -3835,7 +3835,11 @@ def _post_registration(base_url: str, body: Dict[str, str]) -> dict:
     req = Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
         with urlopen(req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            try:
+                return json.loads(resp.read().decode("utf-8"))
+            except UnicodeDecodeError as e:
+                logger.debug("[Feishu onboard] registration response decode failed: %s", e)
+                return None
     except HTTPError as exc:
         body_bytes = exc.read()
         if body_bytes:
@@ -4040,7 +4044,11 @@ def _probe_bot_http(app_id: str, app_secret: str, domain: str) -> Optional[dict]
             headers={"Content-Type": "application/json"},
         )
         with urlopen(token_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
-            token_res = json.loads(resp.read().decode("utf-8"))
+            try:
+                token_res = json.loads(resp.read().decode("utf-8"))
+            except UnicodeDecodeError as e:
+                logger.debug("[Feishu onboard] token response decode failed: %s", e)
+                return None
 
         access_token = token_res.get("tenant_access_token")
         if not access_token:
@@ -4054,7 +4062,11 @@ def _probe_bot_http(app_id: str, app_secret: str, domain: str) -> Optional[dict]
             },
         )
         with urlopen(bot_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
-            bot_res = json.loads(resp.read().decode("utf-8"))
+            try:
+                bot_res = json.loads(resp.read().decode("utf-8"))
+            except UnicodeDecodeError as e:
+                logger.debug("[Feishu onboard] bot info response decode failed: %s", e)
+                return None
 
         return _parse_bot_response(bot_res)
     except (URLError, OSError, KeyError, json.JSONDecodeError) as exc:
