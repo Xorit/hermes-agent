@@ -607,6 +607,7 @@ class GatewayRunner:
         )
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
+        self._gateway_start_time = time.time()  # for uptime tracking in LIFECYCLE logs
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
@@ -1996,11 +1997,22 @@ class GatewayRunner:
         
         self._running = True
         self._update_runtime_status("running")
-        
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
             logger.info("%s hook(s) loaded", hook_count)
+
+        # ── Lifecycle audit log (LIFECYCLE) ─────────────────────────────────
+        # Structured record for daily troubleshooting analysis.
+        import resource
+        _mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        _platforms = [p.value for p in self.adapters.keys()]
+        logger.info(
+            "LIFECYCLE pid=%s python_pid=%s uptime_s=0 connected_platforms=%s "
+            "memory_mb=%.1f startup_status=ok",
+            os.getpid(), os.getpid(), _platforms, _mem_mb,
+        )
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
@@ -2447,6 +2459,22 @@ class GatewayRunner:
             self._draining = False
             self._update_runtime_status("stopped", self._exit_reason)
             logger.info("Gateway stopped")
+
+            # ── Lifecycle audit log (LIFECYCLE) ─────────────────────────────────
+            # Structured record for daily troubleshooting analysis.
+            import resource, time as _time_module
+            _uptime_s = _time_module.time() - self._gateway_start_time
+            _mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            _active_sessions = list(self._running_agents.keys()) if hasattr(self, '_running_agents') else []
+            _exit_type = "restart" if self._restart_requested else "shutdown"
+            _exit_ok = "clean" if not timed_out else "forced"
+            logger.info(
+                "LIFECYCLE pid=%s uptime_s=%.1f connected_platforms=%s "
+                "memory_mb=%.1f active_sessions=%d shutdown_type=%s exit_quality=%s",
+                os.getpid(), _uptime_s,
+                [p.value for p in self.adapters.keys()] if hasattr(self, 'adapters') else [],
+                _mem_mb, len(_active_sessions), _exit_type, _exit_ok,
+            )
 
         self._stop_task = asyncio.create_task(_stop_impl())
         await self._stop_task
