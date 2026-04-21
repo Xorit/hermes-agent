@@ -163,11 +163,11 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
 
         # Initialise schema and run post-WAL integrity check.
-        # Nuke the file and start clean if any of this fails (e.g. WAL recovery
-        # of a mismatched/truncated main DB file).
+        # Before any destructive recovery: snapshot facts to JSON as a safety net.
         try:
             self._conn.execute("PRAGMA integrity_check").fetchone()
             self._init_db()
+            self._try_snapshot()
             self._startup_integrity_check()
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
             # Do not delete DB files for lock/busy contention — that is transient.
@@ -176,21 +176,31 @@ class MemoryStore:
             if not _is_known_corruption_error(exc):
                 raise
 
+            # SAFETY NET: snapshot before destructive recovery
+            self._try_snapshot()
+
             logger.warning(
                 "holographic: existing memory_store file appears corrupt (%s) — "
-                "deleting and recreating. All stored facts will be lost.",
+                "archiving and recreating. All stored facts will be lost.",
                 exc,
             )
             self._conn.close()
             try:
-                logger.info("holographic: unlinking corrupted database file %s", self.db_path)
-                self.db_path.unlink()
-                # Also delete sidecar files to prevent "file is not a database" loop
-                # when recovering from a truncated main DB file.
+                # Rename instead of delete — preserves the corrupt file for forensics
+                import time as _time
+                _ts = int(_time.time())
+                _archive_path = self.db_path.parent / (self.db_path.name + f".corrupted.{_ts}")
+                logger.info("holographic: archiving corrupted database %s → %s", self.db_path, _archive_path)
+                self.db_path.rename(_archive_path)
+                # Also archive sidecar files
                 for sidecar in _wal_sidecar_paths(self.db_path):
                     if sidecar.exists():
-                        logger.info("holographic: deleting orphaned sidecar %s to prevent recovery loop", sidecar)
-                        sidecar.unlink(missing_ok=True)
+                        _sidecar_archive = sidecar.parent / (sidecar.name + f".corrupted.{_ts}")
+                        logger.info("holographic: archiving orphaned sidecar %s → %s", sidecar, _sidecar_archive)
+                        try:
+                            sidecar.rename(_sidecar_archive)
+                        except Exception:
+                            sidecar.unlink(missing_ok=True)
             except FileNotFoundError:
                 pass
 
@@ -301,9 +311,8 @@ class MemoryStore:
                 logger.warning("Could not delete %s: %s", path, exc)
 
         # Re-open on the clean DB (WAL mode will be re-established by _init_db).
-        # If anything goes wrong here, fall back to deleting the DB entirely
-        # and creating a fresh one.  Losing some facts is better than leaving
-        # the store in a broken state where every subsequent operation crashes.
+        # If anything goes wrong here, archive the DB and create a fresh one.
+        # We NEVER silently delete — always rename to .corrupted.TIMESTAMP for recovery.
         try:
             self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
@@ -311,31 +320,56 @@ class MemoryStore:
         except sqlite3.DatabaseError as exc:
             if not _is_known_corruption_error(exc):
                 raise
+            import time as _time
             logger.warning(
-                "holographic: reconnect+init failed (%s) — nuking DB and starting fresh. "
-                "All stored facts will be lost.",
+                "holographic: reconnect+init failed (%s) — archiving DB and starting fresh. "
+                "Corrupted file preserved for recovery. Facts may be restored from JSON snapshot.",
                 exc,
             )
             try:
                 self._conn.close()
             except Exception:
                 pass
-            # Last-ditch: delete the file and start completely fresh.
-            # This handles the case where the main DB itself is corrupt.
+            # Archive the corrupted file instead of deleting it
             try:
-                self.db_path.unlink()
-            except FileNotFoundError:
+                _ts = int(_time.time())
+                _archive = self.db_path.parent / (self.db_path.name + f".corrupted.{_ts}")
+                logger.info("holographic: archiving %s → %s", self.db_path, _archive)
+                self.db_path.rename(_archive)
+            except (FileNotFoundError, OSError):
                 pass
             wal_path, shm_path = _wal_sidecar_paths(self.db_path)
             for path in (wal_path, shm_path):
                 try:
-                    path.unlink()
+                    path.unlink(missing_ok=True)
                 except FileNotFoundError:
                     pass
             self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._init_db()
         logger.info("holographic memory_store re-opened after WAL recovery.")
+
+    def _try_snapshot(self) -> None:
+        """Snapshot facts to JSON as a safety net before destructive recovery.
+        Uses the store's own connection — independent of the provider's method."""
+        try:
+            import json, os as _os
+            from datetime import datetime
+            from hermes_constants import get_hermes_home
+            snap_path = Path(str(get_hermes_home())) / "memory" / "memory_store_snapshot.json"
+            snap_path.parent.mkdir(parents=True, exist_ok=True)
+            facts = [dict(r) for r in self._conn.execute(
+                "SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, created_at, updated_at FROM facts ORDER BY fact_id"
+            ).fetchall()]
+            snapshot = {"version": 1, "timestamp": datetime.now().isoformat(), "facts": facts}
+            tmp = snap_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2, default=str)
+                f.flush()
+            _os.replace(str(tmp), str(snap_path))
+            logger.info("holographic: pre-recovery snapshot saved (%d facts)", len(facts))
+        except Exception as exc:
+            logger.warning("holographic: pre-recovery snapshot failed (non-fatal): %s", exc)
 
     # ------------------------------------------------------------------
     # Public API
