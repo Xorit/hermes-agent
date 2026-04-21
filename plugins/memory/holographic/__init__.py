@@ -164,14 +164,25 @@ class HolographicMemoryProvider(MemoryProvider):
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        # Idempotent: if already initialized, close and reinitialize
+        # Idempotent: keep existing store if it's still healthy.
+        # Closing and recreating on every session start causes WAL replay issues
+        # and "file is not a database" cascading failures (see Apr 21 incident).
         if self._store is not None:
             try:
-                self._store.close()
+                with self._store._lock:
+                    self._store._conn.execute("SELECT 1").fetchone()
+                # Store is healthy — just update session_id and reuse.
+                self._session_id = session_id
+                return
             except Exception:
-                pass
-            self._store = None
-            self._retriever = None
+                logger = logging.getLogger(__name__)
+                logger.warning("holographic: existing store unhealthy, reinitializing")
+                try:
+                    self._store.close()
+                except Exception:
+                    pass
+                self._store = None
+                self._retriever = None
 
         import logging
         logger = logging.getLogger(__name__)
