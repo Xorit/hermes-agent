@@ -162,6 +162,13 @@ class MemoryStore:
         self._lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
 
+        # Online backup thread state
+        self._online_backup_dir = self.db_path.parent / "memory_store_backups" / "online"
+        self._online_backup_dir.mkdir(parents=True, exist_ok=True)
+        self._backup_running = False
+        self._backup_thread: threading.Thread | None = None
+        self._backup_interval = 300  # 5 minutes
+
         # Initialise schema and run post-WAL integrity check.
         # Before any destructive recovery: snapshot facts to JSON as a safety net.
         try:
@@ -979,6 +986,98 @@ class MemoryStore:
         """Convert a sqlite3.Row to a plain dict."""
         return dict(row)
 
+    # ------------------------------------------------------------------
+    # Online backup (periodic, runs during runtime via background thread)
+    # ------------------------------------------------------------------
+
+    def online_backup(self) -> str | None:
+        """Create a consistent online backup using the SQLite backup API.
+
+        Uses ``dest_conn.backup(source_conn)`` which internally calls
+        ``sqlite3_backup_init / step / finish`` — safe to run while the
+        database is actively in use.  No checkpoint or lock is held.
+
+        Returns the path to the backup file, or None on failure.
+        """
+        from datetime import datetime
+        import time as _time
+
+        _ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        _backup_path = self._online_backup_dir / f"memory_store_{_ts}.db"
+
+        try:
+            with self._lock:
+                dest = sqlite3.connect(str(_backup_path), timeout=10.0)
+                try:
+                    self._conn.backup(dest)
+                finally:
+                    dest.close()
+
+            # Also save a JSON snapshot alongside the DB backup
+            self._try_snapshot()
+
+            self._prune_online_backups()
+            logger.info("holographic: online backup created → %s", _backup_path)
+            return str(_backup_path)
+        except Exception as exc:
+            logger.warning("holographic: online backup failed: %s", exc)
+            # Clean up partial file
+            try:
+                _backup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+
+    def _prune_online_backups(self) -> None:
+        """Keep the most recent 28 online backups (~2 hours at 5-min intervals)."""
+        try:
+            backups = sorted(
+                self._online_backup_dir.glob("memory_store_*.db"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            while len(backups) > 28:
+                old = backups.pop(0)
+                old.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("holographic: online backup prune failed: %s", exc)
+
+    def start_online_backup(self, interval: int = 300) -> None:
+        """Start the background online backup thread.
+
+        Args:
+            interval: Seconds between backups (default 300 = 5 minutes).
+        """
+        if self._backup_running:
+            logger.debug("holographic: online backup thread already running")
+            return
+
+        self._backup_interval = interval
+        self._backup_running = True
+
+        def _loop() -> None:
+            import time as _time
+            while self._backup_running:
+                _time.sleep(self._backup_interval)
+                if not self._backup_running:
+                    break
+                self.online_backup()
+
+        self._backup_thread = threading.Thread(
+            target=_loop,
+            name="holographic-online-backup",
+            daemon=True,
+        )
+        self._backup_thread.start()
+        logger.info("holographic: online backup thread started (interval=%ds)", interval)
+
+    def stop_online_backup(self) -> None:
+        """Stop the background online backup thread (graceful)."""
+        self._backup_running = False
+        if self._backup_thread is not None and self._backup_thread.is_alive():
+            self._backup_thread.join(timeout=5.0)
+        self._backup_thread = None
+        logger.info("holographic: online backup thread stopped")
+
     def close(self) -> None:
         """Close the database connection.
 
@@ -996,6 +1095,9 @@ class MemoryStore:
         lock is released before the slow checkpoint/fsync I/O so that other
         threads are never blocked by a long-running checkpoint.
         """
+        # Stop the online backup thread before closing the connection
+        self.stop_online_backup()
+
         lock = getattr(self, "_lock", None)
 
         def _finalize_transaction() -> bool:

@@ -913,5 +913,130 @@ class TestFactStoreActions:
         assert "error" not in result or True
 
 
+class TestOnlineBackup:
+    """Tests for periodic online backup using SQLite backup API."""
+
+    def _make_store(self, tmp_path):
+        from plugins.memory.holographic.store import MemoryStore
+        db = tmp_path / "memory_store.db"
+        store = MemoryStore(db_path=db, default_trust=0.5, hrr_dim=128)
+        return store
+
+    def test_online_backup_creates_file(self, tmp_path):
+        """online_backup() creates a valid SQLite backup file."""
+        store = self._make_store(tmp_path)
+        store.add_fact("Backup test fact", category="general")
+        path = store.online_backup()
+        store.close()
+        assert path is not None
+        p = Path(path)
+        assert p.exists()
+        assert p.stat().st_size > 0
+
+    def test_online_backup_contains_correct_data(self, tmp_path):
+        """Backup file contains all facts from the live DB."""
+        store = self._make_store(tmp_path)
+        store.add_fact("Fact A in backup", category="general")
+        store.add_fact("Fact B in backup", category="user_pref")
+
+        path = store.online_backup()
+        store.close()
+
+        # Open backup as separate DB and verify
+        backup = sqlite3.connect(path)
+        facts = backup.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        fts = backup.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
+        assert facts == 2
+        assert fts == 2
+        backup.close()
+
+    def test_online_backup_concurrent_writes(self, tmp_path):
+        """Backup succeeds even while writes are happening (no lock contention)."""
+        import threading
+        store = self._make_store(tmp_path)
+
+        results = []
+        errors = []
+
+        def _writer():
+            try:
+                for i in range(20):
+                    store.add_fact(f"Concurrent fact {i}", category="general")
+                    import time; time.sleep(0.01)
+            except Exception as e:
+                errors.append(e)
+
+        def _backuper():
+            import time; time.sleep(0.05)
+            r = store.online_backup()
+            results.append(r)
+
+        t1 = threading.Thread(target=_writer)
+        t2 = threading.Thread(target=_backuper)
+        t1.start(); t2.start()
+        t1.join(timeout=10); t2.join(timeout=10)
+
+        assert len(errors) == 0, f"Writer errors: {errors}"
+        assert results[0] is not None, "Backup returned None"
+        assert Path(results[0]).exists()
+        store.close()
+
+    def test_online_backup_pruning(self, tmp_path):
+        """Pruning keeps only the 28 most recent backups."""
+        store = self._make_store(tmp_path)
+        backup_dir = store._online_backup_dir
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create 30 fake backup files
+        for i in range(30):
+            fake = backup_dir / f"memory_store_{i:04d}.db"
+            fake.write_text("fake")
+            import time; time.sleep(0.01)  # ensure different mtimes
+
+        # Run pruning (no real backup, just prune)
+        store._prune_online_backups()
+
+        remaining = sorted(backup_dir.glob("memory_store_*.db"))
+        assert len(remaining) == 28
+        assert remaining[0].name == "memory_store_0002.db"  # oldest 2 pruned
+        store.close()
+
+    def test_start_stop_backup_thread(self, tmp_path):
+        """Backup thread starts and stops cleanly."""
+        store = self._make_store(tmp_path)
+        store.start_online_backup(interval=1)
+        import time; time.sleep(0.1)
+        assert store._backup_running
+        assert store._backup_thread is not None
+        assert store._backup_thread.is_alive()
+
+        store.stop_online_backup()
+        assert not store._backup_running
+        assert store._backup_thread is None or not store._backup_thread.is_alive()
+        store.close()
+
+    def test_close_stops_backup_thread(self, tmp_path):
+        """store.close() automatically stops the backup thread."""
+        store = self._make_store(tmp_path)
+        store.start_online_backup(interval=1)
+        import time; time.sleep(0.1)
+        assert store._backup_thread.is_alive()
+
+        store.close()
+        assert not store._backup_running
+
+    def test_online_backup_failure_cleans_up(self, tmp_path):
+        """Failed backup does not leave partial files behind."""
+        store = self._make_store(tmp_path)
+        # Point backup dir to a non-existent path to force failure
+        store._online_backup_dir = tmp_path / "nonexistent_subdir" / "deep"
+        # Don't create it — backup should fail
+        result = store.online_backup()
+        assert result is None
+        # Verify no partial file
+        assert not (store._online_backup_dir).exists()
+        store.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short", "-x"])

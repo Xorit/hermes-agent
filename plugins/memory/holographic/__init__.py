@@ -215,6 +215,12 @@ class HolographicMemoryProvider(MemoryProvider):
                 hrr_dim=hrr_dim,
             )
             self._session_id = session_id
+
+            # Start periodic online backup thread (every 5 minutes)
+            try:
+                self._store.start_online_backup(interval=300)
+            except Exception as exc:
+                logger.warning("holographic: failed to start online backup thread: %s", exc)
         except Exception as e:
             logger.error("Holographic memory initialize failed: %s. Facts will be unavailable until the gateway restarts.", e)
             # Leave _store as None so handle_tool_call returns a clean error
