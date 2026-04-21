@@ -127,6 +127,7 @@ def _is_known_corruption_error(exc: BaseException) -> bool:
         or "malformed" in msg
         or "unsupported file format" in msg
         or "not a database" in msg
+        or "disk I/O error" in msg
     )
 
 
@@ -157,52 +158,49 @@ class MemoryStore:
             timeout=10.0,
             check_same_thread=False,
         )
+        logger.info("holographic: opened database at %s", self.db_path)
         self._lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
 
-        # Pre-check: probe the existing DB file before running _init_db().
-        # A crash during schema creation can leave a truncated/invalid file
-        # (e.g. exactly one page with no valid header).  sqlite3.connect()
-        # itself succeeds on any file; the error only surfaces when we
-        # execute.  Nuke the file and start clean if probing fails.
+        # Initialise schema and run post-WAL integrity check.
+        # Nuke the file and start clean if any of this fails (e.g. WAL recovery
+        # of a mismatched/truncated main DB file).
         try:
             self._conn.execute("PRAGMA integrity_check").fetchone()
-        except sqlite3.OperationalError as exc:
+            self._init_db()
+            self._startup_integrity_check()
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
             # Do not delete DB files for lock/busy contention — that is transient.
             if _is_lock_or_busy_error(exc):
                 raise
             if not _is_known_corruption_error(exc):
                 raise
-            logger.warning(
-                "holographic: existing memory_store file appears corrupt (%s) — "
-                "deleting and recreating. All stored facts will be lost.",
-                exc,
-            )
-            self._conn.close()
-            try:
-                self.db_path.unlink()
-            except FileNotFoundError:
-                pass
-            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-        except sqlite3.DatabaseError as exc:
-            if not _is_known_corruption_error(exc):
-                raise
-            logger.warning(
-                "holographic: existing memory_store file appears corrupt (%s) — "
-                "deleting and recreating. All stored facts will be lost.",
-                exc,
-            )
-            self._conn.close()
-            try:
-                self.db_path.unlink()
-            except FileNotFoundError:
-                pass
-            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
 
-        self._init_db()
-        self._startup_integrity_check()
+            logger.warning(
+                "holographic: existing memory_store file appears corrupt (%s) — "
+                "deleting and recreating. All stored facts will be lost.",
+                exc,
+            )
+            self._conn.close()
+            try:
+                logger.info("holographic: unlinking corrupted database file %s", self.db_path)
+                self.db_path.unlink()
+                # Also delete sidecar files to prevent "file is not a database" loop
+                # when recovering from a truncated main DB file.
+                for sidecar in _wal_sidecar_paths(self.db_path):
+                    if sidecar.exists():
+                        logger.info("holographic: deleting orphaned sidecar %s to prevent recovery loop", sidecar)
+                        sidecar.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
+
+            # Reconnect and try initialization again (one attempt only)
+            logger.info("holographic: re-establishing connection to %s after recovery", self.db_path)
+            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init_db()
+            self._startup_integrity_check()
+            logger.info("holographic: initialization complete after recovery")
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -233,6 +231,7 @@ class MemoryStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA locking_mode=NORMAL")
+        logger.debug("holographic: configured database (WAL, synchronous=FULL, page_size=%d)", _PAGE_SIZE)
         self._conn.executescript(_SCHEMA)
         # Migrate: add hrr_vector column if missing (safe for existing databases)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
@@ -256,6 +255,8 @@ class MemoryStore:
         """
         try:
             result = self._conn.execute("PRAGMA integrity_check").fetchone()
+            if result and result[0] == "ok":
+                logger.info("holographic: startup integrity check OK")
         except sqlite3.OperationalError as exc:
             # Lock/busy is transient contention, not corruption.
             # Never run destructive recovery in this case.
@@ -413,10 +414,13 @@ class MemoryStore:
 
                 self._conn.execute("RELEASE SAVEPOINT add_fact_start")
                 add_savepoint_active = False
+                self._conn.commit()
+                logger.info("holographic: added fact %d in category '%s'", fact_id, category)
             except Exception:
                 # Any failure: rollback the whole add_fact transaction.
                 if add_savepoint_active:
                     with contextlib.suppress(sqlite3.Error):
+                        logger.warning("holographic: transaction failure in add_fact, rolling back")
                         self._conn.execute("ROLLBACK TO SAVEPOINT add_fact_start")
                     with contextlib.suppress(sqlite3.Error):
                         self._conn.execute("RELEASE SAVEPOINT add_fact_start")
@@ -550,27 +554,31 @@ class MemoryStore:
                             (fact_id, entity_id),
                         )
                     self._conn.execute("RELEASE SAVEPOINT relink_entities")
+                    self._conn.commit()
                 except Exception:
                     self._conn.execute("ROLLBACK TO SAVEPOINT relink_entities")
                     self._conn.execute("RELEASE SAVEPOINT relink_entities")
                     raise  # content is already updated; surface the linking error
 
-                # Recompute HRR vector without the lock held.
-                self._compute_hrr_vector(fact_id, content)
-
             # Rebuild affected bank(s) — only when bank contents actually changed.
-            # content change: bank must be rebuilt (new vector in bundle)
-            # category change: both old and new banks need rebuilding
-            # tags/trust-only change: no bank rebuild needed
+            rebuild_cats = []
             if content is not None or category is not None:
                 cat = category or self._conn.execute(
                     "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
                 ).fetchone()["category"]
-                self._rebuild_bank(cat)
+                rebuild_cats.append(cat)
                 if rebuild_old_cat is not None:
-                    self._rebuild_bank(rebuild_old_cat)
+                    rebuild_cats.append(rebuild_old_cat)
 
-            return True
+        # Release the lock first so concurrent readers are not starved.
+        if content is not None:
+            self._compute_hrr_vector(fact_id, content)
+
+        for cat in rebuild_cats:
+            self._rebuild_bank(cat)
+
+        logger.info("holographic: updated fact %d", fact_id)
+        return True
 
     def remove_fact(self, fact_id: int) -> bool:
         """Delete a fact and its entity links. Returns True if the row existed.
@@ -585,6 +593,7 @@ class MemoryStore:
             if row is None:
                 return False
 
+            cat = row["category"]
             self._conn.execute(
                 "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
             )
@@ -593,7 +602,9 @@ class MemoryStore:
 
             # Only rebuild if the fact contributed a vector to the bundle.
             if row["hrr_vector"] is not None:
-                self._rebuild_bank(row["category"])
+                self._rebuild_bank(cat)
+            
+            logger.info("holographic: removed fact %d from category '%s'", fact_id, cat)
             return True
 
     def list_facts(
@@ -624,6 +635,7 @@ class MemoryStore:
                 LIMIT ?
             """
             rows = self._conn.execute(sql, params).fetchall()
+            logger.debug("holographic: found %d facts for query", len(rows))
             return [self._row_to_dict(r) for r in rows]
 
     def record_feedback(self, fact_id: int, helpful: bool) -> dict:
@@ -800,12 +812,16 @@ class MemoryStore:
             ).fetchall()
             entities = [row["name"] for row in rows]
 
-            vector = hrr.encode_fact(content, entities, self.hrr_dim)
+        logger.debug("holographic: computing vector for fact %d (%d entities)", fact_id, len(entities))
+        vector = hrr.encode_fact(content, entities, self.hrr_dim)
+
+        with self._lock:
             self._conn.execute(
                 "UPDATE facts SET hrr_vector = ? WHERE fact_id = ?",
                 (hrr.phases_to_bytes(vector), fact_id),
             )
             self._conn.commit()
+            logger.debug("holographic: saved vector for fact %d", fact_id)
 
     def _rebuild_bank(self, category: str) -> None:
         """Full rebuild of a category's memory bank from all its fact vectors.
@@ -860,8 +876,8 @@ class MemoryStore:
             # SNR too low — store empty bank; retrieval must use plain FTS.
             # Log the degraded category so it can be monitored.
             logger.warning(
-                "category=%s SNR=%.2f < %.1f threshold; holographic bundle "
-                "skipped for %d facts",
+                "holographic: category '%s' SNR=%.2f < %.1f threshold; bundle "
+                "skipped for %d facts (falling back to FTS)",
                 category, snr, _SNR_MIN, fact_count,
             )
             with self._lock:
@@ -880,6 +896,10 @@ class MemoryStore:
                 self._conn.commit()
             return
 
+        logger.debug(
+            "holographic: bundling %d vectors for category '%s' (SNR=%.2f)", 
+            fact_count, category, snr
+        )
         bank_vector = hrr.bundle(*vectors)
 
         with self._lock:
@@ -896,6 +916,7 @@ class MemoryStore:
                 (bank_name, hrr.phases_to_bytes(bank_vector), self.hrr_dim, fact_count),
             )
             self._conn.commit()
+        logger.info("holographic: rebuilt memory bank for category '%s' (%d facts)", category, fact_count)
 
     def rebuild_all_vectors(self, dim: int | None = None) -> int:
         """Recompute all HRR vectors + banks from text. For recovery/migration.
@@ -945,58 +966,85 @@ class MemoryStore:
 
         This method is guaranteed NOT to raise. Checkpoint failures are logged
         but do not prevent the connection from closing.
+
+        Locking strategy: the RLock is acquired only briefly to finalise any
+        pending transaction (commit or rollback) and check journal mode — the
+        lock is released before the slow checkpoint/fsync I/O so that other
+        threads are never blocked by a long-running checkpoint.
         """
         lock = getattr(self, "_lock", None)
 
-        def _do_close() -> None:
+        def _finalize_transaction() -> bool:
+            """Return True if WAL mode is active (checkpoint is useful)."""
+            try:
+                if self._conn.in_transaction:
+                    self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
             try:
                 row = self._conn.execute("PRAGMA journal_mode").fetchone()
-                if row and row[0].upper() == "WAL":
-                    try:
-                        ckpt = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                        # SQLite returns (busy, log, checkpointed). busy!=0 means
-                        # checkpoint did not complete, even if no exception was raised.
-                        if ckpt and int(ckpt[0]) != 0:
-                            logger.warning(
-                                "WAL checkpoint(TRUNCATE) reported busy=%s for %s; "
-                                "WAL may persist until next clean startup.",
-                                ckpt[0],
-                                self.db_path,
-                            )
-                    except sqlite3.OperationalError as e:
-                        logger.warning(
-                            "WAL checkpoint(TRUNCATE) failed for %s: %s. "
-                            "The WAL file may be orphaned — it will be removed on next startup.",
-                            self.db_path,
-                            e,
-                        )
-                    except Exception as e:
-                        # Defensively catch everything else (DatabaseError, OSError,
-                        # etc.) so close() never propagates an exception.
-                        logger.warning(
-                            "WAL checkpoint(TRUNCATE) raised unexpected %s for %s: %s. "
-                            "WAL sidecar will be removed on next startup.",
-                            type(e).__name__,
-                            self.db_path,
-                            e,
-                        )
+                return row is not None and row[0].upper() == "WAL"
             except Exception:
-                pass  # Connection is already closed or completely broken
+                return False
+
+        def _do_checkpoint() -> None:
+            """Run the WAL checkpoint OUTSIDE the RLock — slow I/O must not block writers."""
+            try:
+                ckpt = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if ckpt and int(ckpt[0]) != 0:
+                    logger.warning(
+                        "WAL checkpoint(TRUNCATE) reported busy=%s for %s; "
+                        "WAL may persist until next clean startup.",
+                        ckpt[0],
+                        self.db_path,
+                    )
+            except sqlite3.OperationalError as e:
+                logger.warning(
+                    "WAL checkpoint(TRUNCATE) failed for %s: %s. "
+                    "The WAL file may be orphaned — it will be removed on next startup.",
+                    self.db_path,
+                    e,
+                )
+            except Exception as e:
+                logger.warning(
+                    "WAL checkpoint(TRUNCATE) raised unexpected %s for %s: %s. "
+                    "WAL sidecar will be removed on next startup.",
+                    type(e).__name__,
+                    self.db_path,
+                    e,
+                )
+
+        def _close_connection() -> None:
             try:
                 self._conn.close()
+                logger.info("holographic: closed database at %s", self.db_path)
             except Exception:
                 pass  # Double-close is safe
 
         if lock is None:
-            _do_close()
+            is_wal = _finalize_transaction()
+            if is_wal:
+                _do_checkpoint()
+            _close_connection()
             return
 
+        is_wal = False
         try:
             with lock:
-                _do_close()
+                is_wal = _finalize_transaction()
+            # checkpoint runs WITHOUT the lock held — slow I/O must not block writers
+            if is_wal:
+                _do_checkpoint()
         except Exception:
-            # Keep "never raise" contract even if lock itself is compromised.
-            pass
+            pass  # never raise contract
+        finally:
+            try:
+                _close_connection()
+            except Exception:
+                pass
 
     def __enter__(self) -> "MemoryStore":
         return self

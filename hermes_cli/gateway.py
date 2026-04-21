@@ -1886,6 +1886,7 @@ def systemd_restart(system: bool = False):
         _wait_for_systemd_service_restart(system=system, previous_pid=pid)
         return
 
+
     if _recover_pending_systemd_restart(system=system, previous_pid=pid):
         return
 
@@ -2811,6 +2812,29 @@ def _runtime_health_lines() -> list[str]:
         lines.append(f"⏳ Gateway draining for {action} ({count} active agent(s))")
     elif gateway_state == "stopped" and exit_reason:
         lines.append(f"⚠ Last shutdown reason: {exit_reason}")
+
+    # --- Holographic Memory Status ---
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        if isinstance(cfg, dict):
+            h_cfg = cfg.get("plugins", {}).get("hermes-memory-store", {})
+            db_path_raw = h_cfg.get("db_path")
+            if db_path_raw:
+                db_path = Path(db_path_raw).expanduser()
+                if db_path.exists():
+                    size_kb = db_path.stat().st_size / 1024
+                    lines.append(f"💾 Holographic DB: {db_path.name} ({size_kb:.1f} KB)")
+                    
+                    # Check for sidecars
+                    wal_path = Path(str(db_path) + "-wal")
+                    if wal_path.exists():
+                        wal_size = wal_path.stat().st_size / 1024
+                        lines.append(f"   ↳ Active WAL: {wal_size:.1f} KB")
+                else:
+                    lines.append(f"💾 Holographic DB: {db_path.name} (not found)")
+    except Exception:
+        pass
 
     return lines
 

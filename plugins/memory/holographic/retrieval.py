@@ -56,23 +56,17 @@ class FactRetriever:
         min_trust: float = 0.3,
         limit: int = 10,
     ) -> list[dict]:
-        """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
-
-        Pipeline:
-        1. FTS5 search: Get limit*3 candidates from SQLite full-text search
-        2. Jaccard boost: Token overlap between query and fact content
-        3. Trust weighting: final_score = relevance * trust_score
-        4. Temporal decay (optional): decay = 0.5^(age_days / half_life)
-
-        Returns list of dicts with fact data + 'score' field, sorted by score desc.
-        """
+        """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting."""
+        logger.debug("holographic: starting search for '%s' (cat=%s, min_trust=%.2f)", query, category, min_trust)
         with self.store._lock:
             # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
             candidates = self._fts_candidates(query, category, min_trust, limit * 3)
 
             if not candidates:
+                logger.debug("holographic: search for '%s' yielded 0 candidates", query)
                 return []
 
+            logger.debug("holographic: search for '%s' found %d FTS candidates", query, len(candidates))
             # Stage 2: Rerank with Jaccard + HRR + trust + optional decay
             # Note: hrr_vector is still present in each fact dict at this point.
             # It is stripped below after scoring is complete.
@@ -113,6 +107,9 @@ class FactRetriever:
             # Sort by score descending, return top limit
             scored.sort(key=lambda x: x["score"], reverse=True)
             results = scored[:limit]
+            
+            logger.debug("holographic: search for '%s' returning top %d results (best score: %.3f)", query, len(results), results[0]["score"] if results else 0)
+            
             # Strip raw HRR bytes — callers expect JSON-serializable dicts
             for fact in results:
                 fact.pop("hrr_vector", None)
@@ -348,6 +345,7 @@ class FactRetriever:
 
     def contradict(
         self,
+        entity: str | None = None,
         category: str | None = None,
         threshold: float = 0.3,
         limit: int = 10,
@@ -358,11 +356,11 @@ class FactRetriever:
         low content-vector similarity (different claims). This is automated
         memory hygiene — no other memory system does this.
         """
-        return self.contradiction(category=category, threshold=threshold, limit=limit)
+        return self.contradiction(entity=entity, category=category, threshold=threshold, limit=limit)
 
     def contradiction(
         self,
-        entity: str,
+        entity: str | None = None,
         category: str | None = None,
         threshold: float = 0.4,
         limit: int = 10,

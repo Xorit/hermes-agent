@@ -520,7 +520,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             import yaml as _yaml
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 config = _yaml.safe_load(f) or {}
 
             # Navigate to platforms.telegram.extra.dm_topics
@@ -1698,7 +1698,7 @@ class TelegramAdapter(BasePlatformAdapter):
             home = get_hermes_home()
             response_path = home / ".update_response"
             tmp = response_path.with_suffix(".tmp")
-            tmp.write_text(answer)
+            tmp.write_text(answer, encoding="utf-8")
             tmp.replace(response_path)
             logger.info("Telegram update prompt answered '%s' by user %s",
                         answer, getattr(query.from_user, "id", "unknown"))
@@ -2745,18 +2745,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
                         text_content = raw_bytes.decode("utf-8")
-                        display_name = original_filename or f"document{ext}"
-                        display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                        injection = f"[Content of {display_name}]:\n{text_content}"
-                        if event.text:
-                            event.text = f"{injection}\n\n{event.text}"
-                        else:
-                            event.text = injection
                     except UnicodeDecodeError:
+                        text_content = raw_bytes.decode("utf-8", errors="replace")
                         logger.warning(
-                            "[Telegram] Could not decode text file as UTF-8, skipping content injection",
+                            "[Telegram] UTF-8 decode error for text file; using replacement characters",
                             exc_info=True,
                         )
+
+                    display_name = original_filename or f"document{ext}"
+                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                    injection = f"[Content of {display_name}]:\n{text_content}"
+                    if event.text:
+                        event.text = f"{injection}\n\n{event.text}"
+                    else:
+                        event.text = injection
 
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
@@ -2882,7 +2884,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             import yaml as _yaml
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 config = _yaml.safe_load(f) or {}
 
             dm_topics = (

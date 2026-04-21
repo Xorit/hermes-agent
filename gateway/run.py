@@ -305,6 +305,7 @@ from gateway.whatsapp_identity import (
 )
 
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -837,7 +838,7 @@ class GatewayRunner:
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text())
+            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8", errors="replace"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
@@ -865,7 +866,8 @@ class GatewayRunner:
         try:
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._VOICE_MODE_PATH.write_text(
-                json.dumps(self._voice_mode, indent=2)
+                json.dumps(self._voice_mode, indent=2),
+                encoding="utf-8",
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
@@ -1690,7 +1692,7 @@ class GatewayRunner:
 
         path = _hermes_home / self._STUCK_LOOP_FILE
         try:
-            counts = json.loads(path.read_text()) if path.exists() else {}
+            counts = json.loads(path.read_text(encoding="utf-8", errors="replace")) if path.exists() else {}
         except Exception:
             counts = {}
 
@@ -1702,7 +1704,7 @@ class GatewayRunner:
         # (they might become active again next restart)
 
         try:
-            path.write_text(json.dumps(new_counts))
+            path.write_text(json.dumps(new_counts), encoding="utf-8")
         except Exception:
             pass
 
@@ -1720,7 +1722,7 @@ class GatewayRunner:
             return 0
 
         try:
-            counts = json.loads(path.read_text())
+            counts = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             return 0
 
@@ -1766,11 +1768,11 @@ class GatewayRunner:
         if not path.exists():
             return
         try:
-            counts = json.loads(path.read_text())
+            counts = json.loads(path.read_text(encoding="utf-8", errors="replace"))
             if session_key in counts:
                 del counts[session_key]
                 if counts:
-                    path.write_text(json.dumps(counts))
+                    path.write_text(json.dumps(counts), encoding="utf-8")
                 else:
                     path.unlink(missing_ok=True)
         except Exception:
@@ -3162,7 +3164,7 @@ class GatewayRunner:
                 response_path = _hermes_home / ".update_response"
                 try:
                     tmp = response_path.with_suffix(".tmp")
-                    tmp.write_text(response_text)
+                    tmp.write_text(response_text, encoding="utf-8")
                     tmp.replace(response_path)
                 except OSError as e:
                     logger.warning("Failed to write update response: %s", e)
@@ -3681,7 +3683,11 @@ class GatewayRunner:
                                 stderr=asyncio.subprocess.PIPE,
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                            output = (stdout or stderr).decode().strip()
+                            raw_output = stdout or stderr
+                            try:
+                                output = raw_output.decode("utf-8").strip()
+                            except UnicodeDecodeError:
+                                output = raw_output.decode("utf-8", errors="replace").strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
                             return "Quick command timed out (30s)."
@@ -5211,7 +5217,8 @@ class GatewayRunner:
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
             (_hermes_home / ".restart_notify.json").write_text(
-                json.dumps(notify_data)
+                json.dumps(notify_data),
+                encoding="utf-8",
             )
         except Exception as e:
             logger.debug("Failed to write restart notify file: %s", e)
@@ -7689,7 +7696,7 @@ class GatewayRunner:
             "timestamp": datetime.now().isoformat(),
         }
         _tmp_pending = pending_path.with_suffix(".tmp")
-        _tmp_pending.write_text(json.dumps(pending))
+        _tmp_pending.write_text(json.dumps(pending), encoding="utf-8")
         _tmp_pending.replace(pending_path)
         exit_code_path.unlink(missing_ok=True)
 
@@ -7776,7 +7783,7 @@ class GatewayRunner:
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
-                    pending = json.loads(path.read_text())
+                    pending = json.loads(path.read_text(encoding="utf-8", errors="replace"))
                     platform_str = pending.get("platform")
                     chat_id = pending.get("chat_id")
                     session_key = pending.get("session_key")
@@ -7799,7 +7806,7 @@ class GatewayRunner:
                     return
                 await asyncio.sleep(poll_interval)
             if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
-                exit_code_path.write_text("124")
+                exit_code_path.write_text("124", encoding="utf-8")
                 await self._send_update_notification()
             return
 
@@ -7837,7 +7844,7 @@ class GatewayRunner:
                 # Read any remaining output
                 if output_path.exists():
                     try:
-                        content = output_path.read_text()
+                        content = output_path.read_text(encoding="utf-8", errors="replace")
                         if len(content) > bytes_sent:
                             buffer += content[bytes_sent:]
                             bytes_sent = len(content)
@@ -7847,7 +7854,7 @@ class GatewayRunner:
 
                 # Send final status
                 try:
-                    exit_code_raw = exit_code_path.read_text().strip() or "1"
+                    exit_code_raw = exit_code_path.read_text(encoding="utf-8", errors="replace").strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
                         await adapter.send(chat_id, "✅ Hermes update finished.")
@@ -7868,7 +7875,7 @@ class GatewayRunner:
             # Check for new output
             if output_path.exists():
                 try:
-                    content = output_path.read_text()
+                    content = output_path.read_text(encoding="utf-8", errors="replace")
                     if len(content) > bytes_sent:
                         buffer += content[bytes_sent:]
                         bytes_sent = len(content)
@@ -7886,7 +7893,7 @@ class GatewayRunner:
             if (prompt_path.exists() and session_key
                     and not self._update_prompt_pending.get(session_key)):
                 try:
-                    prompt_data = json.loads(prompt_path.read_text())
+                    prompt_data = json.loads(prompt_path.read_text(encoding="utf-8", errors="replace"))
                     prompt_text = prompt_data.get("prompt", "")
                     default = prompt_data.get("default", "")
                     if prompt_text:
@@ -7930,7 +7937,7 @@ class GatewayRunner:
         # Timeout
         if not exit_code_path.exists():
             logger.warning("Update watcher timed out after %.0fs", timeout)
-            exit_code_path.write_text("124")
+            exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
             try:
                 await adapter.send(chat_id, "❌ Hermes update timed out after 30 minutes.")
@@ -7972,7 +7979,7 @@ class GatewayRunner:
             elif not claimed_path.exists():
                 return True
 
-            pending = json.loads(claimed_path.read_text())
+            pending = json.loads(claimed_path.read_text(encoding="utf-8", errors="replace"))
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
 
@@ -7983,13 +7990,13 @@ class GatewayRunner:
                 claimed_path.replace(pending_path)
                 return False
 
-            exit_code_raw = exit_code_path.read_text().strip() or "1"
+            exit_code_raw = exit_code_path.read_text(encoding="utf-8", errors="replace").strip() or "1"
             exit_code = int(exit_code_raw)
 
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text()
+                output = output_path.read_text(encoding="utf-8", errors="replace")
 
             # Resolve adapter
             platform = Platform(platform_str)
@@ -8035,7 +8042,7 @@ class GatewayRunner:
             return
 
         try:
-            data = json.loads(notify_path.read_text())
+            data = json.loads(notify_path.read_text(encoding="utf-8", errors="replace"))
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
@@ -10861,18 +10868,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 except Exception:
                     pass
                 return False
-            # Wait up to 10 seconds for the old process to exit
-            for _ in range(20):
+            # Wait for the old process to exit (graceful drain)
+            timeout = GatewayRunner._load_restart_drain_timeout()
+            # Add a buffer for tool cleanup and process reaping
+            wait_until = _time.time() + timeout + 5.0
+            while _time.time() < wait_until:
                 try:
                     os.kill(existing_pid, 0)
                     time.sleep(0.5)
                 except (ProcessLookupError, PermissionError):
                     break  # Process is gone
             else:
-                # Still alive after 10s — force kill
+                # Still alive after timeout — force kill
                 logger.warning(
-                    "Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.",
+                    "Old gateway (PID %d) did not exit after %.0fs graceful drain, sending SIGKILL.",
                     existing_pid,
+                    timeout,
                 )
                 try:
                     terminate_pid(existing_pid, force=True)
