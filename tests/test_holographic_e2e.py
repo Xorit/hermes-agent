@@ -935,50 +935,76 @@ class TestOnlineBackup:
 
     def test_online_backup_contains_correct_data(self, tmp_path):
         """Backup file contains all facts from the live DB."""
+        import time
         store = self._make_store(tmp_path)
         store.add_fact("Fact A in backup", category="general")
         store.add_fact("Fact B in backup", category="user_pref")
 
         path = store.online_backup()
+        time.sleep(3)  # fire-and-forget: wait for subprocess
+
         store.close()
 
         # Open backup as separate DB and verify
         backup = sqlite3.connect(path)
         facts = backup.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
         fts = backup.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
-        assert facts == 2
+        assert facts == 2, f"Expected 2 facts, got {facts}"
         assert fts == 2
+        backup.close()
+
+    def test_online_backup_creates_file(self, tmp_path):
+        """online_backup() spawns a subprocess that creates a valid SQLite backup file."""
+        store = self._make_store(tmp_path)
+        store.add_fact("Backup test fact", category="general")
+
+        # online_backup() is fire-and-forget: it spawns a Popen subprocess
+        # and returns immediately.  Wait for the file to appear.
+        path = store.online_backup()
+        import time; time.sleep(2)  # give subprocess time to complete
+
+        store.close()
+
+        assert path is not None
+        p = Path(path)
+        assert p.exists(), f"Backup file not found: {p}"
+        assert p.stat().st_size > 0, f"Backup file is empty: {p}"
+
+        # Verify it's a valid SQLite DB with the fact
+        backup = sqlite3.connect(str(p))
+        facts = backup.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        assert facts == 1, f"Expected 1 fact, got {facts}"
         backup.close()
 
     def test_online_backup_concurrent_writes(self, tmp_path):
         """Backup succeeds even while writes are happening (no lock contention)."""
-        import threading
+        import threading, time
         store = self._make_store(tmp_path)
 
-        results = []
-        errors = []
+        write_done = threading.Event()
+        backup_file = [None]
 
         def _writer():
-            try:
-                for i in range(20):
-                    store.add_fact(f"Concurrent fact {i}", category="general")
-                    import time; time.sleep(0.01)
-            except Exception as e:
-                errors.append(e)
+            for i in range(20):
+                store.add_fact(f"Concurrent fact {i}", category="general")
+                time.sleep(0.01)
+            write_done.set()
 
         def _backuper():
-            import time; time.sleep(0.05)
-            r = store.online_backup()
-            results.append(r)
+            time.sleep(0.05)
+            backup_file[0] = store.online_backup()
+            time.sleep(3)  # wait for fire-and-forget subprocess to finish
 
         t1 = threading.Thread(target=_writer)
         t2 = threading.Thread(target=_backuper)
         t1.start(); t2.start()
         t1.join(timeout=10); t2.join(timeout=10)
 
-        assert len(errors) == 0, f"Writer errors: {errors}"
-        assert results[0] is not None, "Backup returned None"
-        assert Path(results[0]).exists()
+        assert write_done.is_set(), "Writer did not complete"
+        assert backup_file[0] is not None, "online_backup() returned None"
+        p = Path(backup_file[0])
+        assert p.exists(), f"Backup file not found: {p}"
+        assert p.stat().st_size > 0
         store.close()
 
     def test_online_backup_pruning(self, tmp_path):
@@ -1026,15 +1052,23 @@ class TestOnlineBackup:
         assert not store._backup_running
 
     def test_online_backup_failure_cleans_up(self, tmp_path):
-        """Failed backup does not leave partial files behind."""
+        """Failed backup (bad path) does not leave partial files behind.
+
+        With fire-and-forget subprocess, online_backup() returns immediately.
+        We verify the subprocess exits without a trace (no file created).
+        """
         store = self._make_store(tmp_path)
-        # Point backup dir to a non-existent path to force failure
+        # Point backup dir to a non-existent nested path — subprocess will fail
         store._online_backup_dir = tmp_path / "nonexistent_subdir" / "deep"
-        # Don't create it — backup should fail
+        # online_backup() returns the path immediately (subprocess spawned)
         result = store.online_backup()
-        assert result is None
-        # Verify no partial file
-        assert not (store._online_backup_dir).exists()
+        import time; time.sleep(2)  # wait for fire-and-forget subprocess
+
+        assert result is not None, "online_backup() should return path on Popen success"
+        # No file was created because the directory doesn't exist
+        assert not Path(result).exists(), f"Partial file should not exist: {result}"
+        # The parent directory chain should also not be created
+        assert not (tmp_path / "nonexistent_subdir").exists()
         store.close()
 
 
