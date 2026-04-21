@@ -137,8 +137,92 @@ def _wal_sidecar_paths(db_path: Path) -> tuple[Path, Path]:
     return Path(base + "-wal"), Path(base + "-shm")
 
 
+#: Global store registry: db_path (str) -> MemoryStore instance
+_instances: dict[str, "MemoryStore"] = {}
+_refcounts: dict[str, int] = {}
+_initialized: set[str] = set()  # which keys have had _init() run
+
+
 class MemoryStore:
-    """SQLite-backed fact store with entity resolution and trust scoring."""
+    """SQLite-backed fact store with entity resolution and trust scoring.
+
+    Thread-safe singleton per ``db_path`` using reference counting.
+    Use :meth:`acquire` to get (or create) a store, and :meth:`release`
+    when done.  The store is only closed when the last caller releases it.
+    """
+
+    def acquire(
+        db_path: "str | Path | None" = None,
+        default_trust: float = 0.5,
+        hrr_dim: int = 1024,
+    ) -> "MemoryStore":
+        """Return the singleton store for *db_path*, creating it if needed.
+
+        Thread-safe: concurrent calls for the same ``db_path`` receive the
+        same instance.  An internal reference counter tracks how many
+        ``acquire`` calls are outstanding; the store is only closed when
+        the last caller invokes :meth:`release`.
+        """
+        if db_path is None:
+            from hermes_constants import get_hermes_home
+            db_path = str(get_hermes_home() / "memory_store.db")
+        key = str(Path(db_path).expanduser().resolve())
+
+        with threading.Lock():
+            if key in _instances:
+                store = _instances[key]
+                _refcounts[key] += 1
+                logger.debug(
+                    "holographic: acquired existing store for %s (refs=%d)",
+                    key, _refcounts[key],
+                )
+                return store
+
+            # Create new instance and initialise it.
+            store = object.__new__(MemoryStore)
+            _instances[key] = store
+            _refcounts[key] = 1
+            store._init(key, default_trust, hrr_dim)
+            logger.info("holographic: created new store for %s", key)
+            return store
+
+    def release(self) -> None:
+        """Decrement the reference count and close the store when it reaches 0.
+
+        Idempotent: calling on an already-released store is a no-op.
+        """
+        key = str(self.db_path.resolve())
+        with threading.Lock():
+            if key not in _instances:
+                return  # already released
+            rc = _refcounts[key] - 1
+            _refcounts[key] = rc
+            logger.debug(
+                "holographic: released store for %s (refs=%d)",
+                key, rc,
+            )
+            if rc <= 0:
+                _instances.pop(key, None)
+                _refcounts.pop(key, None)
+                self._unsafe_close()
+                logger.info("holographic: closed store for %s (last ref)", key)
+
+    # ------------------------------------------------------------------
+    # Private constructor — initialise without allocating a new db connection.
+    # All real work is done in _init(), called once per store lifetime.
+    # ------------------------------------------------------------------
+
+    def __new__(
+        cls,
+        db_path: "str | Path | None" = None,
+        default_trust: float = 0.5,
+        hrr_dim: int = 1024,
+    ) -> "MemoryStore":
+        # Always create a fresh object.  The singleton is tracked in module-level
+        # _instances/_refcounts; __init__ will find it and increment the count,
+        # or create it if absent.  Using __new__ this way lets us intercept the
+        # call BEFORE __init__ runs so we can guarantee a clean object identity.
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -146,10 +230,25 @@ class MemoryStore:
         default_trust: float = 0.5,
         hrr_dim: int = 1024,
     ) -> None:
-        if db_path is None:
-            from hermes_constants import get_hermes_home
-            db_path = str(get_hermes_home() / "memory_store.db")
-        self.db_path = Path(db_path).expanduser()
+        # Idempotent entry: if this object is already the singleton, just bump
+        # the refcount and return.  This happens when __new__ returned the
+        # cached singleton on a subsequent call.
+        if getattr(self, "_initialized", False):
+            key = str(self.db_path.resolve())
+            with threading.Lock():
+                _refcounts[key] = _refcounts.get(key, 0) + 1
+            return
+        # Fresh object: acquire (or create) the singleton and adopt its state.
+        # acquire() creates exactly one store per db_path; we set _initialized
+        # on THIS object so future calls via THIS object bump the refcount.
+        singleton = MemoryStore.acquire(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
+        self.__dict__.clear()
+        self.__dict__.update(singleton.__dict__)
+        self._initialized = True
+
+    def _init(self, key: str, default_trust: float, hrr_dim: int) -> None:
+        """Actually initialise instance state (called once per store)."""
+        self.db_path = Path(key)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_trust = _clamp_trust(default_trust)
         self.hrr_dim = hrr_dim
@@ -168,6 +267,11 @@ class MemoryStore:
         self._backup_running = False
         self._backup_thread: threading.Thread | None = None
         self._backup_interval = 300  # 5 minutes
+
+        # Mark as initialised BEFORE running schema/init code so that if
+        # __init__ is called again (via Python's __new__ path), the guard in
+        # __init__ bumps refcount without re-running init logic.
+        self._initialized = True
 
         # Initialise schema and run post-WAL integrity check.
         # Before any destructive recovery: snapshot facts to JSON as a safety net.
@@ -1113,19 +1217,22 @@ except Exception:
     def close(self) -> None:
         """Close the database connection.
 
-        TRUNCATE checkpoint writes all WAL frames back to the main DB file,
-        then truncates the WAL to 0 bytes — preventing orphaned -wal/-shm files
-        after a crash and keeping the store as a single-file backup target.
+        Delegates to :meth:`release` for reference-counted lifetime management.
 
-        Only runs in WAL mode; DELETE/FULL journals do not support checkpoints.
+        This method is guaranteed NOT to raise.
+        """
+        try:
+            self.release()
+        except Exception:
+            pass
 
-        This method is guaranteed NOT to raise. Checkpoint failures are logged
-        but do not prevent the connection from closing.
+    def _unsafe_close(self) -> None:
+        """Internal close — checkpoint WAL, stop backup thread, close connection.
 
-        Locking strategy: the RLock is acquired only briefly to finalise any
-        pending transaction (commit or rollback) and check journal mode — the
-        lock is released before the slow checkpoint/fsync I/O so that other
-        threads are never blocked by a long-running checkpoint.
+        Called automatically by :meth:`release` when the reference count reaches
+        0.  Should never be called directly by external callers.
+
+        This method is guaranteed NOT to raise.
         """
         # Stop the online backup thread before closing the connection
         self.stop_online_backup()
