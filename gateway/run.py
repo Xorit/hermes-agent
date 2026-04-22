@@ -10070,30 +10070,35 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         nonlocal _signal_initiated_shutdown
         _signal_initiated_shutdown = True
         logger.info("Received SIGTERM/SIGINT — initiating shutdown")
-        # Diagnostic: log all hermes-related processes so we can identify
-        # what triggered the signal (hermes update, hermes gateway restart,
-        # a stale detached subprocess, etc.).
-        try:
-            import subprocess as _sp
-            _ps = _sp.run(
-                ["ps", "aux"],
-                capture_output=True, text=True, timeout=3,
-            )
-            _hermes_procs = [
-                line for line in _ps.stdout.splitlines()
-                if ("hermes" in line.lower() or "gateway" in line.lower())
-                and str(os.getpid()) not in line.split()[1:2]  # exclude self
-            ]
-            if _hermes_procs:
-                logger.warning(
-                    "Shutdown diagnostic — other hermes processes running:\n  %s",
-                    "\n  ".join(_hermes_procs),
+        # Diagnostic: run ps aux as an async task so it doesn't block the
+        # event loop. Store reference to prevent GC before completion.
+        async def _log_hermes_procs():
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    "ps aux",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-            else:
-                logger.info("Shutdown diagnostic — no other hermes processes found")
-        except Exception:
-            pass
-        asyncio.create_task(runner.stop())
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+                heroku_procs = [
+                    line for line in stdout.decode().splitlines()
+                    if ("hermes" in line.lower() or "gateway" in line.lower())
+                    and str(os.getpid()) not in line.split()[1:2]
+                ]
+                if heroku_procs:
+                    logger.warning(
+                        "Shutdown diagnostic — other hermes processes running:\n  %s",
+                        "\n  ".join(heroku_procs),
+                    )
+                else:
+                    logger.info("Shutdown diagnostic — no other hermes processes found")
+            except Exception:
+                pass
+        _ps_task = asyncio.create_task(_log_hermes_procs())
+        _stop_task = asyncio.create_task(runner.stop())
+        # Store on module globals so they aren't GC'd before completing
+        globals()["__shutdown_ps_task"] = _ps_task
+        globals()["__shutdown_stop_task"] = _stop_task
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)

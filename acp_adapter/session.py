@@ -449,8 +449,16 @@ class SessionManager:
             "enabled_toolsets": ["hermes-acp"],
             "quiet_mode": True,
             "session_id": session_id,
-            "model": model or default_model,
         }
+
+        # ACP sessions: if no explicit memory provider is configured, force
+        # holographic so fact_store/fact_feedback work in the ACP context.
+        # This overrides the default AIAgent behavior which skips the plugin
+        # when memory.provider is absent from config.
+        _mem_cfg = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
+        if not _mem_cfg.get("provider"):
+            kwargs["memory_provider_override"] = "holographic"
+        kwargs["model"] = model or default_model
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
