@@ -435,6 +435,15 @@ class HolographicMemoryProvider(MemoryProvider):
     # -- Tool handlers -------------------------------------------------------
 
     def _handle_fact_store(self, args: dict) -> str:
+        # Lazy-init: if store is None, attempt to initialize before failing.
+        # This handles the case where AIAgent was created with
+        # memory_provider_override="holographic" but the provider was not yet
+        # activated (e.g., ACP session context before first use).
+        if self._store is None:
+            try:
+                self.initialize(session_id=self._session_id or "default")
+            except Exception:
+                pass
         if self._store is None:
             return tool_error("Holographic memory is not initialized. The database may be missing or corrupted. Try deleting $HERMES_HOME/memory_store.db and restarting the gateway.", success=False)
         try:
@@ -528,6 +537,14 @@ class HolographicMemoryProvider(MemoryProvider):
             return tool_error(str(exc))
 
     def _handle_fact_feedback(self, args: dict) -> str:
+        # Lazy-init: if store is None, attempt to initialize before failing.
+        if self._store is None:
+            try:
+                self.initialize(session_id=self._session_id or "default")
+            except Exception:
+                pass
+        if self._store is None:
+            return tool_error("Holographic memory is not initialized.", success=False)
         try:
             fact_id = int(args["fact_id"])
             helpful = args["action"] == "helpful"
