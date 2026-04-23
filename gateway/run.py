@@ -10080,15 +10080,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
-                heroku_procs = [
+                hermes_procs = [
                     line for line in stdout.decode().splitlines()
                     if ("hermes" in line.lower() or "gateway" in line.lower())
                     and str(os.getpid()) not in line.split()[1:2]
                 ]
-                if heroku_procs:
+                if hermes_procs:
                     logger.warning(
                         "Shutdown diagnostic — other hermes processes running:\n  %s",
-                        "\n  ".join(heroku_procs),
+                        "\n  ".join(hermes_procs),
                     )
                 else:
                     logger.info("Shutdown diagnostic — no other hermes processes found")
