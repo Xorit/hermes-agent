@@ -207,6 +207,12 @@ class HolographicMemoryProvider(MemoryProvider):
             )
             self._session_id = session_id
 
+            # One-time startup check: if hrr_vector column has >10% NULL values,
+            # trigger a background rebuild so retrieval quality recovers gradually.
+            # This catches cases where ALTER TABLE ADD COLUMN left old facts with
+            # NULL vectors before _compute_hrr_vector ran on them.
+            self._check_and_rebuild_vectors_bg()
+
             # Start periodic online backup thread (every 5 minutes).
             # With singleton, this only starts once — on the first session.
             # Subsequent sessions hit the "already running" guard in start_online_backup().
@@ -307,6 +313,16 @@ class HolographicMemoryProvider(MemoryProvider):
                 return tool_error("Holographic memory is not initialized. The database may be missing or corrupted. Try deleting $HERMES_HOME/memory_store.db and restarting the gateway.", success=False)
             return tool_error(f"Memory error: {e}")
         except Exception as e:
+            # Distinguish FTS5 parse errors — these indicate a malformed query
+            # and should be surfaced clearly so the caller can correct it.
+            if hasattr(e, "query") and e.query:
+                return tool_error(
+                    f"FTS5 query error for '{e.query}': {e}. "
+                    f"This usually means the query contains FTS5 syntax characters "
+                    f"(AND, OR, NOT, quotes, dots) that caused a parse failure. "
+                    f"Try simplifying the query.",
+                    success=False,
+                )
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
@@ -635,6 +651,14 @@ class HolographicMemoryProvider(MemoryProvider):
         try:
             conn = self._store._conn
             with self._store._lock:
+                # Checkpoint the WAL before snapshotting to ensure we read a
+                # consistent state — all WAL pages merged into the main DB.
+                # Without this, concurrent _unsafe_close may truncate the WAL
+                # while we are reading, producing an inconsistent snapshot.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
                 facts = conn.execute(
                     "SELECT fact_id, content, category, tags, trust_score, "
                     "       retrieval_count, helpful_count, created_at, updated_at, "
@@ -682,6 +706,43 @@ class HolographicMemoryProvider(MemoryProvider):
             )
         except Exception as e:
             logger.debug("holographic: snapshot failed: %s", e)
+
+    def _check_and_rebuild_vectors_bg(self) -> None:
+        """Check hrr_vector NULL ratio at startup and rebuild in background if >10% missing.
+
+        Runs once per provider instance (not per session). The check itself is fast
+        (two COUNT queries). If the threshold is exceeded, the rebuild runs in a
+        daemon thread so it does not block gateway startup.
+        """
+        import threading
+
+        def _rebuild() -> None:
+            try:
+                count = self._store.count_facts()
+                if count == 0:
+                    return
+                null_count = self._store._conn.execute(
+                    "SELECT COUNT(*) FROM facts WHERE hrr_vector IS NULL"
+                ).fetchone()[0]
+                null_ratio = null_count / count
+                if null_ratio > 0.10:
+                    logger.warning(
+                        "holographic: %.1f%% of facts have NULL hrr_vectors (%d/%d) — "
+                        "triggering background rebuild",
+                        null_ratio * 100,
+                        null_count,
+                        count,
+                    )
+                    rebuilt = self._store.rebuild_all_vectors()
+                    logger.info(
+                        "holographic: background hrr_vector rebuild complete — %d facts processed",
+                        rebuilt,
+                    )
+            except Exception as exc:
+                logger.debug("holographic: hrr_vector NULL check failed: %s", exc)
+
+        t = threading.Thread(target=_rebuild, daemon=True)
+        t.start()
 
 
 # ---------------------------------------------------------------------------
