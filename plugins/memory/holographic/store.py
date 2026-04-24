@@ -12,6 +12,100 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+class FTSQueryError(Exception):
+    """Raised when an FTS5 MATCH query is malformed or references invalid columns.
+
+    This is distinct from transient OperationalErrors (lock/busy) which should
+    be retried, not surfaced to the caller.
+    """
+
+    def __init__(self, message: str, *, query: str = ""):
+        super().__init__(message)
+        self.query = query
+
+
+def _is_fts_parse_error(exc: BaseException) -> bool:
+    """Return True if this is an FTS5 parse/grammar error, not a transient error.
+
+    FTS5 parse errors include: malformed MATCH syntax, no such column/table,
+    unrecognized tokens. Transient errors include: lock, busy, I/O errors.
+    """
+    msg = str(exc).lower()
+    # FTS5-specific error signatures
+    fts_parse_hints = (
+        "fts5:",          # FTS5 error prefix
+        "no such column",
+        "no such table",
+        "malformed match",
+        "fts5 syntax",
+        "unrecognized token",
+        "unterminated string",
+        "syntax error",
+        "parser error",
+    )
+    return any(hint in msg for hint in fts_parse_hints)
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """Sanitize a raw string for use as an FTS5 MATCH operand.
+
+    FTS5 query syntax is complex and certain characters/patterns can cause
+    'no such column' or parse errors when the query is passed literally.
+    Notably: bare identifiers containing dots (table.column) look like
+    column references to the FTS5 parser, and double-quoted strings are
+    phrase operators — if the quoted content is not a valid FTS5 phrase
+    the parser raises an error.
+
+    Strategy: strip FTS5 boolean operators that are unlikely to be intentional
+    in a natural-language probe, strip double-quote phrase wrappers, and
+    collapse internal whitespace.
+    """
+    if not query:
+        return ""
+    # Strip FTS5 boolean operators — users seldom intend them in a probe query
+    # and they cause parse errors when used without proper FTS5 table config.
+    stripped = re.sub(r"\bAND\b|\bOR\b|\bNOT\b", "", query, flags=re.IGNORECASE)
+    # Strip double-quote phrase wrappers — they break when content is not a
+    # valid phrase or contains characters that FTS5 interprets as operators.
+    # E.g. '"pve-01.internal"' → 'pve-01.internal' (dot no longer quoted).
+    stripped = re.sub(r'"([^"]*)"', r"\1", stripped)
+    # Collapse excess whitespace
+    collapsed = re.sub(r"\s+", " ", stripped).strip()
+
+    # Remove FTS5 metacharacters that are not meaningful in a probe:
+    #   []  — interpreted as column-name brackets by FTS5 parser, cause
+    #          'syntax error near "["' when not properly escaped/closed.
+    #   {}  — FTS5 column specification brackets, also cause parse errors.
+    #   *   — wildcard: allowed in FTS5 but causes 'near "*": syntax error'
+    #          in a bare MATCH expression without explicit column prefix.
+    #   : (  ) — parentheses are FTS5 syntax; colons can appear in column
+    #            specs and cause spurious parse errors in a bare query.
+    # We strip all of these because they carry little semantic value for
+    # a natural-language probe and regularly appear in machine-generated
+    # strings (HA notifications, log messages) that get stored as facts.
+    # FTS5 treats - as a unary negation operator. In an unquoted token like
+    # `ipad-pro-13` it parses as `ipad - pro - 13`, and `ZG-204ZL_2_FL` as
+    # `ZG - 204ZL_2_FL` (column subtraction). Both cause spurious parse
+    # errors ("no such column"). Replace hyphens with spaces so hyphenated
+    # identifiers become separate tokens instead of subtraction expressions.
+    #   .  — FTS5 interprets dot as table.column reference; "no such column"
+    #          errors arise from bare identifiers with dots in probe queries.
+    #   ,  — grouping operator in FTS5; causes "syntax error near ','" when
+    #          commas appear in free-text probe strings (system prompts, etc.)
+    #   >  — FTS5 comparison operator; "syntax error near '>'" when 'greater
+    #          than' symbol appears in natural-language probe text.
+    #   <  — same, for 'less than' comparisons appearing in probe text.
+    cleaned = re.sub(r"[][{}*():.<>,\-]", " ", collapsed)
+
+    # If stripping left only whitespace (e.g. a pure bracket string), the
+    # FTS5 query would be empty — bail out so callers get an empty result
+    # rather than a parse error.
+    if not cleaned.strip():
+        return ""
+
+    return cleaned.strip()
+
 try:
     from . import holographic as hrr
 except ImportError:
@@ -28,7 +122,14 @@ _SNR_MIN         =  3.0   # minimum SNR before bundling; below this = noise
 _PAGE_SIZE       =  4096  # set before journal_mode=WAL
 
 # Entity extraction patterns
-_RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+_RE_CAPITALIZED           = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+# Hyphenated capitalized terms: "Self-Driving Car", "Machine-Learning Approach"
+# Each hyphenated segment starts with uppercase; optionally followed by more words.
+_RE_HYPHEN_CAPITALIZED    = re.compile(
+    r'\b([A-Z][a-z]+(?:-[A-Z][a-z]+)+(?:\s+[A-Z][a-z]+)*)\b'
+)
+# Uppercase slash-delimited abbreviations: "CI/CD", "HTTP/HTTPS", "API/Web"
+_RE_SLASH_UPPERCASE       = re.compile(r'\b([A-Z]{2,}(?:/[A-Z]{2,})+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
 _RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
 _RE_AKA          = re.compile(
@@ -124,10 +225,8 @@ def _is_known_corruption_error(exc: BaseException) -> bool:
     return (
         "file is not a database" in msg
         or "database disk image is malformed" in msg
-        or "malformed" in msg
         or "unsupported file format" in msg
         or "not a database" in msg
-        or "disk I/O error" in msg
     )
 
 
@@ -135,6 +234,208 @@ def _wal_sidecar_paths(db_path: Path) -> tuple[Path, Path]:
     # Do not use with_suffix("-wal"): it raises on paths with no extension.
     base = str(db_path)
     return Path(base + "-wal"), Path(base + "-shm")
+
+
+def _try_early_snapshot(db_path: str) -> None:
+    """Snapshot facts to JSON before ANY SQLite connection is opened.
+
+    Uses a completely independent read-only connection. This is the
+    earliest possible safety net — it runs before _init() touches the
+    DB, so it succeeds even if the main connection path hits corruption.
+    """
+    try:
+        import json
+        import os as _os
+        from datetime import datetime
+        from hermes_constants import get_hermes_home
+
+        # Resolve the actual DB path. The canonical path is memory_store.db
+        # under HERMES_HOME, but the live DB may live in a subdirectory
+        # (e.g. HERMES_HOME/memory/memory_store.db).  Scan for the actual file
+        # to avoid snapshotting an empty placeholder.
+        hp = Path(str(get_hermes_home()))
+        candidates = [hp / "memory_store.db", hp / "memory" / "memory_store.db"]
+        actual_db = None
+        for c in candidates:
+            if c.exists() and c.stat().st_size > 0:
+                # Verify it has the facts table before committing to it
+                try:
+                    tconn = sqlite3.connect(f"file:{c}?mode=ro", uri=True, timeout=2.0)
+                    tables = tconn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+                    ).fetchone()
+                    tconn.close()
+                    if tables:
+                        actual_db = str(c)
+                except Exception:
+                    pass
+        if actual_db is None:
+            logger.debug("holographic: early snapshot skipped — no DB with facts found")
+            return
+
+        snap_path = hp / "memory" / "memory_store_snapshot.json"
+        snap_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Open with isolation_level=None (autocommit) and read-only for
+        # maximum isolation from whatever _init() does with the main conn.
+        conn = sqlite3.connect(f"file:{actual_db}?mode=ro", uri=True, timeout=3.0)
+        try:
+            rows = conn.execute(
+                "SELECT fact_id, content, category, tags, trust_score, "
+                "retrieval_count, helpful_count, created_at, updated_at, hrr_vector "
+                "FROM facts ORDER BY fact_id"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        facts = []
+        for r in rows:
+            # r is a plain tuple — build dict by name, not dict(tuple)
+            d = {
+                "fact_id": r[0],
+                "content": r[1],
+                "category": r[2],
+                "tags": r[3],
+                "trust_score": r[4],
+                "retrieval_count": r[5],
+                "helpful_count": r[6],
+                "created_at": r[7],
+                "updated_at": r[8],
+                "hrr_vector": bytes(r[9]).hex() if r[9] is not None else None,
+            }
+            facts.append(d)
+
+        snapshot = {
+            "version": 2,
+            "timestamp": datetime.now().isoformat(),
+            "facts": facts,
+        }
+        tmp = snap_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, default=str)
+            f.flush()
+        _os.replace(str(tmp), str(snap_path))
+        logger.info("holographic: early snapshot saved (%d facts)", len(facts))
+    except Exception as exc:
+        logger.warning("holographic: early snapshot failed (non-fatal): %s", exc)
+
+
+def _try_recover_wal(db_path: str) -> bool:
+    """Attempt to checkpoint a stale WAL into the DB before opening.
+
+    Returns True if WAL was successfully recovered (DB updated).
+    Returns False if no WAL existed or recovery failed (non-fatal).
+
+    Uses SQLite's backup API to safely recover committed data from the WAL
+    that was never checkpointed into the main DB due to an unclean close.
+    """
+    wal_path = db_path + "-wal"
+    if not Path(wal_path).exists():
+        return False  # no WAL to recover
+
+    try:
+        # Step 1: Open WAL DB read-only to validate it's usable
+        wal_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            result = wal_conn.execute("PRAGMA integrity_check").fetchone()
+            if result is None or result[0] != "ok":
+                logger.debug(
+                    "holographic: WAL exists for %s but WAL DB integrity check "
+                    "failed — skipping WAL recovery",
+                    db_path,
+                )
+                return False
+        finally:
+            wal_conn.close()
+
+        # Step 2: Use backup API to recover committed data from WAL.
+        # backup() copies all committed pages from WAL into a fresh DB,
+        # then we overwrite the main DB with that recovered copy.
+        # This is safer than PRAGMA wal_checkpoint on a live DB path
+        # because a partial checkpoint can't corrupt the existing main DB.
+        src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        dst = sqlite3.connect(timeout=5.0)  # in-memory DB as recovery target
+        try:
+            src.backup(dst)
+        finally:
+            src.close()
+            dst.close()
+
+        # Step 3: Verify the recovered DB is valid before overwriting.
+        # Open the in-memory DB and run integrity_check.
+        recovered_conn = sqlite3.connect(timeout=5.0)
+        try:
+            recovered_conn.execute("PRAGMA quick_check").fetchone()
+        except Exception:
+            logger.warning(
+                "holographic: WAL recovery for %s produced invalid DB — skipping",
+                db_path,
+            )
+            return False
+        finally:
+            recovered_conn.close()
+
+        # Step 4: Overwrite main DB with recovered data + truncate WAL.
+        # sqlite3.backup() to a file target merges WAL into the file atomically.
+        recovery_dst = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
+        recovery_src = sqlite3.connect(timeout=5.0)
+        try:
+            recovery_src.backup(recovery_dst)
+        finally:
+            recovery_dst.close()
+            recovery_src.close()
+
+        # Step 5: Verify the file on disk is valid before deleting WAL/SHM.
+        # Opening a NEW connection to the actual file path (not in-memory) ensures
+        # we are checking what was actually written, not just the in-memory state.
+        # This catches partial-write failures (disk full, SIGKILL mid-write).
+        try:
+            verify_conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
+            try:
+                check_result = verify_conn.execute("PRAGMA quick_check").fetchone()
+                if check_result is None or check_result[0] != "ok":
+                    logger.warning(
+                        "holographic: WAL recovery disk-write verification failed for %s — "
+                        "not truncating WAL/SHM; DB may be partially written",
+                        db_path,
+                    )
+                    return False
+            finally:
+                verify_conn.close()
+        except Exception as exc:
+            logger.warning(
+                "holographic: WAL recovery disk-write verification error for %s: %s — "
+                "not truncating WAL/SHM",
+                db_path,
+                exc,
+            )
+            return False
+
+        # Truncate WAL and SHM since their contents are now in the main DB.
+        for sidecar in (db_path + "-wal", db_path + "-shm"):
+            try:
+                Path(sidecar).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        logger.info("holographic: WAL recovery successful for %s", db_path)
+        return True
+
+    except sqlite3.OperationalError as exc:
+        logger.debug(
+            "holographic: WAL recovery for %s failed (non-fatal): %s",
+            db_path,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.debug(
+            "holographic: WAL recovery for %s raised unexpected %s: %s",
+            db_path,
+            type(exc).__name__,
+            exc,
+        )
+        return False
 
 
 #: Global store registry: db_path (str) -> MemoryStore instance
@@ -248,6 +549,18 @@ class MemoryStore:
 
     def _init(self, key: str, default_trust: float, hrr_dim: int) -> None:
         """Actually initialise instance state (called once per store)."""
+        # Phase 1: Snapshot BEFORE we touch anything — independent read-only
+        # connection, non-fatal.  This fires on every startup regardless of
+        # whether corruption is detected, so the snapshot always reflects the
+        # last known-good state.
+        _try_early_snapshot(key)
+
+        # Phase 2: Attempt WAL recovery before opening the main connection.
+        # If the previous shutdown was unclean, committed data may be sitting
+        # in the WAL file.  This checkpoint merges it into the main DB using
+        # the backup API (safest path — never partially overwrites the DB).
+        _try_recover_wal(key)
+
         self.db_path = Path(key)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_trust = _clamp_trust(default_trust)
@@ -274,11 +587,11 @@ class MemoryStore:
         self._initialized = True
 
         # Initialise schema and run post-WAL integrity check.
-        # Before any destructive recovery: snapshot facts to JSON as a safety net.
+        # _try_early_snapshot() already ran above (before any DB open) and saved
+        # a snapshot regardless of outcome — no need to repeat it here.
         try:
             self._conn.execute("PRAGMA integrity_check").fetchone()
             self._init_db()
-            self._try_snapshot()
             self._startup_integrity_check()
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
             # Do not delete DB files for lock/busy contention — that is transient.
@@ -286,9 +599,6 @@ class MemoryStore:
                 raise
             if not _is_known_corruption_error(exc):
                 raise
-
-            # SAFETY NET: snapshot before destructive recovery
-            self._try_snapshot()
 
             logger.warning(
                 "holographic: existing memory_store file appears corrupt (%s) — "
@@ -317,7 +627,7 @@ class MemoryStore:
 
             # Reconnect and try initialization again (one attempt only)
             logger.info("holographic: re-establishing connection to %s after recovery", self.db_path)
-            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0)
             self._conn.row_factory = sqlite3.Row
             self._init_db()
             self._startup_integrity_check()
@@ -579,9 +889,12 @@ class MemoryStore:
 
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
         descending. Also increments retrieval_count for matched facts.
+
+        Raises FTSQueryError if the query is malformed (non-transient parse error).
         """
         with self._lock:
-            query = query.strip()
+            raw_query = query
+            query = _sanitize_fts_query(query.strip())
             if not query:
                 return []
 
@@ -605,7 +918,23 @@ class MemoryStore:
                 LIMIT ?
             """
 
-            rows = self._conn.execute(sql, params).fetchall()
+            try:
+                rows = self._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as exc:
+                if _is_fts_parse_error(exc):
+                    logger.warning(
+                        "holographic: FTS5 parse error for query '%s' (original: '%s'): %s",
+                        query, raw_query, exc,
+                    )
+                    raise FTSQueryError(str(exc), query=raw_query) from exc
+                # Lock/busy and other transient errors: return empty silently
+                # but log at DEBUG for observability.
+                logger.debug("holographic: transient DB error in search_facts, returning empty: %s", exc)
+                return []
+            except Exception:
+                # SQL logic errors, ProgrammingError, etc. — do not swallow
+                raise
+
             results = [self._row_to_dict(r) for r in rows]
 
             if results:
@@ -852,6 +1181,12 @@ class MemoryStore:
                 candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
+            _add(m.group(1))
+
+        for m in _RE_HYPHEN_CAPITALIZED.finditer(text):
+            _add(m.group(1))
+
+        for m in _RE_SLASH_UPPERCASE.finditer(text):
             _add(m.group(1))
 
         for m in _RE_DOUBLE_QUOTE.finditer(text):

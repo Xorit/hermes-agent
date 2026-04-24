@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import logging
 import math
+import sqlite3
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
 
 if TYPE_CHECKING:
     from .store import MemoryStore
@@ -21,6 +27,8 @@ try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+from .store import FTSQueryError, _is_fts_parse_error, _sanitize_fts_query
 
 
 class FactRetriever:
@@ -430,6 +438,17 @@ class FactRetriever:
             _MAX_CONTRADICT_SECONDS = 5.0
             timed_out = False
 
+            # Preload all HRR vectors into a numpy matrix to avoid repeated
+            # deserialization in the O(n^2) inner loop.  At 500 facts × 1024 dim
+            # this is ~4 MB — negligible vs the deserialization savings.
+            # Preload happens inside the outer _lock so it is safe to deserialize.
+            fact_vectors: list[np.ndarray] = []
+            for f in facts:
+                try:
+                    fact_vectors.append(hrr.bytes_to_phases(f["hrr_vector"]))
+                except Exception:
+                    fact_vectors.append(np.zeros(self.store.hrr_dim, dtype=np.float64))
+
             for i in range(len(facts)):
                 for j in range(i + 1, len(facts)):
                     if time.monotonic() - start_time > _MAX_CONTRADICT_SECONDS:
@@ -445,8 +464,8 @@ class FactRetriever:
                     )
                     if entity_overlap < 0.3:
                         continue
-                    v1 = hrr.bytes_to_phases(f1["hrr_vector"])
-                    v2 = hrr.bytes_to_phases(f2["hrr_vector"])
+                    v1 = fact_vectors[i]
+                    v2 = fact_vectors[j]
                     content_sim = hrr.similarity(v1, v2)
                     contradiction_score = entity_overlap * (1.0 - (content_sim + 1.0) / 2.0)
                     if contradiction_score >= threshold:
@@ -519,8 +538,16 @@ class FactRetriever:
 
         Note: bm25() must appear in ORDER BY, not just SELECT, so the database
         returns the top-k rows by relevance before we re-score in Python.
+
+        Raises FTSQueryError if the FTS5 query is malformed (non-transient parse
+        error, distinct from lock/busy which is returned as empty silently).
         """
         conn = self.store._conn
+
+        raw_query = query
+        query = _sanitize_fts_query(query)
+        if not query:
+            return []
 
         params: list = []
         where_clauses = ["facts_fts MATCH ?"]
@@ -549,9 +576,20 @@ class FactRetriever:
 
         try:
             rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            # FTS5 MATCH can fail on malformed queries — fall back to empty
+        except sqlite3.OperationalError as exc:
+            if _is_fts_parse_error(exc):
+                logger.warning(
+                    "holographic: FTS5 parse error in _fts_candidates for query '%s' "
+                    "(original: '%s'): %s",
+                    query, raw_query, exc,
+                )
+                raise FTSQueryError(str(exc), query=raw_query) from exc
+            # Lock/busy — transient contention, return empty silently but log for observability.
+            logger.debug("holographic: transient DB error in _fts_candidates, returning empty: %s", exc)
             return []
+        except Exception:
+            # Do not swallow non-OperationalError exceptions
+            raise
 
         if not rows:
             return []
