@@ -1943,6 +1943,21 @@ class HermesCLI:
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        # MiniMax Token Plan quota — fire-and-forget, never blocks
+        try:
+            from hermes_cli.minimax_quota import refresh_quota_async, get_cached_quota
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            runtime = resolve_runtime_provider()
+            provider = runtime.get("provider", "")
+            if provider in ("minimax", "minimax-cn"):
+                refresh_quota_async(
+                    runtime.get("api_key") or "",
+                    runtime.get("base_url") or "",
+                )
+                snapshot["minimax_quota"] = get_cached_quota()
+        except Exception:
+            snapshot["minimax_quota"] = None
+
         return snapshot
 
     @staticmethod
@@ -2083,6 +2098,12 @@ class HermesCLI:
 
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             parts.append(duration_label)
+            # MiniMax Token Plan quota — wide terminals only
+            quota = snapshot.get("minimax_quota")
+            if quota and not quota.get("error") and quota.get("used_percent", 0) < 100:
+                used = quota["used_percent"]
+                reset = quota.get("reset_time_utc", "")
+                parts.append(f" │ 5h: {used}% @ {reset}")
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -2141,8 +2162,15 @@ class HermesCLI:
                         (bar_style, percent_label),
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
-                        ("class:status-bar", " "),
                     ]
+                    # MiniMax Token Plan quota — wide terminals only
+                    quota = snapshot.get("minimax_quota")
+                    if quota and not quota.get("error") and quota.get("used_percent", 0) < 100:
+                        used = quota["used_percent"]
+                        reset = quota.get("reset_time_utc", "")
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", f"5h: {used}% @ {reset}"))
+                    frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
             if total_width > width:
