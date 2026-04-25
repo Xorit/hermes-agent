@@ -507,7 +507,8 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
 def _translate_stream_event(
     event: Dict[str, Any],
     model: str,
-    tool_call_counter: List[int],
+    tool_call_counter: Optional[List[int]] = None,
+    tool_call_indices: Optional[Dict[str, int]] = None,
 ) -> List[_GeminiStreamChunk]:
     """Unwrap Code Assist envelope and emit OpenAI-shaped chunk(s).
 
@@ -516,7 +517,14 @@ def _translate_stream_event(
     fresh, unique OpenAI ``index`` — keying by function name would collide
     whenever the model issues parallel calls to the same tool (e.g. reading
     three files in one turn).
+
+    ``tool_call_indices`` is accepted only for backward compatibility with
+    older tests/callers that keyed indices by tool name. Name-keyed indices
+    are intentionally no longer used because parallel calls to the same tool
+    must receive distinct OpenAI indices.
     """
+    if tool_call_counter is None:
+        tool_call_counter = [len(tool_call_indices or {})]
     inner = event.get("response") if isinstance(event.get("response"), dict) else event
     candidates = inner.get("candidates") or []
     if not candidates:
