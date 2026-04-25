@@ -1177,6 +1177,87 @@ class TestProviderRegistration:
         assert result["project_id"] == "my-proj"
         assert result["email"] == "t@e.com"
 
+    def test_model_picker_lists_logged_in_google_gemini_cli(self):
+        """The /model picker must see Google OAuth creds stored outside auth.json."""
+        from agent.google_oauth import GoogleCredentials, save_credentials
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        save_credentials(GoogleCredentials(
+            access_token="live-tok",
+            refresh_token="rt",
+            expires_ms=int((time.time() + 3600) * 1000),
+            project_id="my-proj",
+            email="t@e.com",
+        ))
+
+        providers = list_authenticated_providers(
+            current_provider="google-gemini-cli",
+            max_models=10,
+        )
+        google = next((p for p in providers if p["slug"] == "google-gemini-cli"), None)
+        assert google is not None
+        assert google["is_current"] is True
+        assert "gemini-3.1-pro-preview" in google["models"]
+        assert "gemini-3-flash-preview" in google["models"]
+        assert "gemini-3.1-flash-lite-preview" in google["models"]
+        assert "gemini-2.5-flash" in google["models"]
+
+    def test_google_gemini_cli_model_catalog_uses_live_quota_buckets(self):
+        """Live Code Assist quota buckets should augment the static fallback list."""
+        from hermes_cli.models import provider_model_ids
+
+        buckets = [
+            SimpleNamespace(model_id="gemini-2.5-flash"),
+            SimpleNamespace(model_id="gemini-live-new-preview"),
+            SimpleNamespace(model_id="gemini-2.5-flash"),
+        ]
+        with patch(
+            "hermes_cli.auth.resolve_gemini_oauth_runtime_credentials",
+            return_value={"api_key": "tok", "project_id": "proj"},
+        ), patch(
+            "agent.google_code_assist.retrieve_user_quota",
+            return_value=buckets,
+        ) as mock_quota:
+            models = provider_model_ids("google-gemini-cli")
+
+        assert models[0] == "gemini-2.5-flash"
+        assert "gemini-live-new-preview" in models
+        assert models.count("gemini-2.5-flash") == 1
+        mock_quota.assert_called_once_with(
+            "tok",
+            project_id="proj",
+            user_agent_model="gemini-2.5-flash",
+        )
+
+    def test_auxiliary_resolver_supports_google_gemini_cli(self):
+        """Auxiliary provider resolution should not reject google-gemini-cli OAuth."""
+        from agent.google_oauth import GoogleCredentials, save_credentials
+        from agent.auxiliary_client import resolve_provider_client
+
+        save_credentials(GoogleCredentials(
+            access_token="live-tok",
+            refresh_token="rt",
+            expires_ms=int((time.time() + 3600) * 1000),
+            project_id="my-proj",
+            email="t@e.com",
+        ))
+
+        with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value = mock_client
+            client, model = resolve_provider_client(
+                "google-gemini-cli",
+                "gemini-2.5-flash",
+            )
+
+        assert client is mock_client
+        assert model == "gemini-2.5-flash"
+        mock_client_cls.assert_called_once_with(
+            api_key="live-tok",
+            base_url="cloudcode-pa://google",
+            project_id="my-proj",
+        )
+
     def test_determine_api_mode(self):
         from hermes_cli.providers import determine_api_mode
 

@@ -187,6 +187,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.1-pro-preview",
         "gemini-3-pro-preview",
         "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
     ],
     "zai": [
         "glm-5.1",
@@ -1799,6 +1803,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     return live
         except Exception:
             pass
+    if normalized == "google-gemini-cli":
+        live = fetch_google_gemini_cli_models()
+        if live:
+            return live
     if normalized == "anthropic":
         live = _fetch_anthropic_models()
         if live:
@@ -1838,6 +1846,45 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized in _MODELS_DEV_PREFERRED:
         return _merge_with_models_dev(normalized, curated_static)
     return curated_static
+
+
+def fetch_google_gemini_cli_models() -> Optional[list[str]]:
+    """Fetch google-gemini-cli model IDs from Code Assist quota buckets.
+
+    Cloud Code Assist does not expose a public OpenAI-style /models endpoint.
+    The official Gemini CLI learns preview access from quota buckets returned by
+    retrieveUserQuota, so use those modelId values as the live account-specific
+    catalog and fall back to _PROVIDER_MODELS when auth/quota is unavailable.
+    """
+    try:
+        from agent.google_code_assist import retrieve_user_quota
+        from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials
+
+        creds = resolve_gemini_oauth_runtime_credentials()
+        buckets = retrieve_user_quota(
+            str(creds.get("api_key", "") or ""),
+            project_id=str(creds.get("project_id", "") or ""),
+            user_agent_model="gemini-2.5-flash",
+        )
+    except Exception:
+        return None
+
+    seen: set[str] = set()
+    live: list[str] = []
+    for bucket in buckets:
+        model_id = str(getattr(bucket, "model_id", "") or "").strip()
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            live.append(model_id)
+    if not live:
+        return None
+
+    # Put Hermes' preferred order first, then append any new backend-reported
+    # models so newly rolled-out models still appear without a code change.
+    preferred = list(_PROVIDER_MODELS.get("google-gemini-cli", []))
+    ordered = [mid for mid in preferred if mid in seen]
+    ordered.extend(mid for mid in live if mid not in ordered)
+    return ordered
 
 
 def _fetch_anthropic_models(timeout: float = 5.0) -> Optional[list[str]]:
