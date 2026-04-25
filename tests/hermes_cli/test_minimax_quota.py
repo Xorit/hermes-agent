@@ -64,6 +64,8 @@ class TestFetchMinimaxQuota:
                     "current_interval_usage_count": 330_000,  # USED, not remaining
                     "end_time": 1777060800000,   # 2026-04-24 20:00 UTC
                     "weekly_end_time": 1777248000000,  # 2026-04-27 00:00 UTC
+                    "current_weekly_total_count": 10_000_000,
+                    "current_weekly_usage_count": 3_300_000,  # 33% used
                 }
             ]
         }
@@ -73,6 +75,7 @@ class TestFetchMinimaxQuota:
         assert result["error"] is None
         assert result["used_percent"] == 33  # 330K / 1M * 100 = 33
         assert result["reset_time_utc"] == "Apr 24 20:00 UTC"
+        assert result["weekly_used_percent"] == 33  # 3.3M / 10M * 100 = 33
         assert result["weekly_reset_utc"] == "Apr 27 00:00 UTC"
 
     def test_used_percent_is_100_when_exhausted(self):
