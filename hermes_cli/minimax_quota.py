@@ -130,6 +130,14 @@ def _fetch_minimax_quota(api_key: str, inference_base_url: str) -> Dict[str, Any
     }
 
 
+def _clear_quota_cache() -> None:
+    """Clear the module-level quota cache and pending state."""
+    global _quota_cache, _quota_cache_ts, _pending_start
+    _quota_cache = None
+    _quota_cache_ts = 0.0
+    _pending_start = 0.0
+
+
 def _background_refresh(api_key: str, inference_base_url: str) -> None:
     """Fire-and-forget background thread entry point. Updates module cache."""
     global _quota_cache, _quota_cache_ts
@@ -147,8 +155,8 @@ def refresh_quota_async(api_key: str, inference_base_url: str) -> None:
     Thread-safe: TUI render path only reads _quota_cache (atomic dict read).
     Background thread writes _quota_cache (atomic dict write). No lock needed.
     """
-    global _quota_cache, _quota_cache_ts
-    if _quota_cache is None or (time.time() - _quota_cache_ts) > QUOTA_CACHE_TTL or (_quota_cache.get('pending') and (time.time() - _pending_start) > 10):
+    global _quota_cache, _quota_cache_ts, _pending_start
+    if _quota_cache is None or (time.time() - _quota_cache_ts) > QUOTA_CACHE_TTL or (_quota_cache.get("pending") and (time.time() - _pending_start) > 10):
         t = Thread(
             target=_background_refresh,
             args=(api_key, inference_base_url),
@@ -163,14 +171,18 @@ def get_cached_quota() -> Optional[Dict[str, Any]]:
     return _quota_cache
 
 
-def _canonical_minimax_provider(provider: Any, base_url: Any = "") -> str:
-    """Return a canonical provider id, inferring MiniMax from aliases or host.
+def _canonical_minimax_provider(provider: Any, base_url: Any = "", api_key: Any = "") -> str:
+    """Return a canonical provider id, inferring MiniMax from aliases, host, or API key.
 
     Status-bar snapshots can be rendered before the runtime provider has been
     fully canonicalized (for example while it is still ``auto``).  The MiniMax
     quota endpoint is tied to the direct MiniMax hosts, so the base URL is a
     reliable fallback signal when the provider string is still an alias or raw
     pre-resolution value.
+
+    The API key is a last-resort signal: MiniMax keys are typically 60+ chars
+    and start with ``ey`` (JWT).  We only use key pattern matching when both
+    ``provider`` and ``base_url`` are uninformative.
     """
     normalized = str(provider or "").strip().lower()
     try:
@@ -194,6 +206,13 @@ def _canonical_minimax_provider(provider: Any, base_url: Any = "") -> str:
     if host == "api.minimaxi.com" or host.endswith(".minimaxi.com"):
         return "minimax-cn"
 
+    # Last resort: probe the API key pattern.
+    # MiniMax keys are JWT tokens (eyJ... format), typically 60+ chars.
+    key = str(api_key or "").strip()
+    if len(key) >= 60 and key.startswith("ey"):
+        # Heuristic: long JWT-style token is typical for MiniMax
+        return "minimax"
+
     return normalized
 
 
@@ -205,14 +224,17 @@ def _inject_minimax_quota(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> 
     global _quota_cache, _pending_start
 
     base_url = runtime.get("base_url") or ""
-    provider = _canonical_minimax_provider(runtime.get("provider", ""), base_url)
+    api_key = runtime.get("api_key") or ""
+    provider = _canonical_minimax_provider(runtime.get("provider", ""), base_url, api_key)
+
     if provider not in ("minimax", "minimax-cn"):
+        # Provider switched away — clear stale cache so there is no cross-contamination
+        # when switching back to MiniMax within the same session.
+        _clear_quota_cache()
         return
+
     try:
-        refresh_quota_async(
-            runtime.get("api_key") or "",
-            base_url,
-        )
+        refresh_quota_async(api_key, base_url)
         # Always read from the live module cache so the snapshot always has the
         # most recent data.  Snapshot dicts are created fresh on each render, so
         # copying the cache contents here is safe and ensures the snapshot always
@@ -222,6 +244,10 @@ def _inject_minimax_quota(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> 
         if cached is None:
             _quota_cache = {"pending": True}
             _pending_start = time.time()
+        # Reset _pending_start once we have real (non-pending) data so the module
+        # state is clean after the transition.
+        elif not cached.get("pending"):
+            _pending_start = 0.0
         snapshot["minimax_quota"] = dict(_quota_cache) if _quota_cache else None
     except Exception:
         snapshot["minimax_quota"] = None
