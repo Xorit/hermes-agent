@@ -64,6 +64,8 @@ from agent.usage_pricing import (
     format_token_count_compact,
 )
 from hermes_cli.banner import _format_context_length, format_banner_version_label
+# Register the MiniMax Token Plan quota hook so _get_status_bar_snapshot can call it.
+import hermes_cli.minimax_quota  # noqa: F401 — side-effect: registers status-bar hook
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
@@ -2097,7 +2099,7 @@ class HermesCLI:
             parts.append(duration_label)
             # MiniMax Token Plan quota — wide terminals only
             quota = snapshot.get("minimax_quota")
-            if quota and not quota.get("error") and quota.get("used_percent", 0) < 100:
+            if quota and not quota.get("pending") and not quota.get("error") and quota.get("used_percent", 0) < 100:
                 used = quota["used_percent"]
                 reset = quota.get("reset_time_utc", "")
                 parts.append(f" │ 5h: {used}% @ {reset}")
@@ -2162,7 +2164,7 @@ class HermesCLI:
                     ]
                     # MiniMax Token Plan quota — wide terminals only
                     quota = snapshot.get("minimax_quota")
-                    if quota and not quota.get("error") and quota.get("used_percent", 0) < 100:
+                    if quota and not quota.get("pending") and not quota.get("error") and quota.get("used_percent", 0) < 100:
                         used = quota["used_percent"]
                         reset = quota.get("reset_time_utc", "")
                         frags.append(("class:status-bar-dim", " │ "))

@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 _quota_cache: Optional[Dict[str, Any]] = None
 _quota_cache_ts: float = 0.0
 QUOTA_CACHE_TTL: float = 60.0  # seconds before stale refresh is triggered
+_pending_start: float = 0.0  # Track when pending state was set
 
 
 @dataclass
@@ -141,7 +142,7 @@ def refresh_quota_async(api_key: str, inference_base_url: str) -> None:
     Background thread writes _quota_cache (atomic dict write). No lock needed.
     """
     global _quota_cache, _quota_cache_ts
-    if _quota_cache is None or (time.time() - _quota_cache_ts) > QUOTA_CACHE_TTL:
+    if _quota_cache is None or (time.time() - _quota_cache_ts) > QUOTA_CACHE_TTL or (_quota_cache.get('pending') and (time.time() - _pending_start) > 10):
         t = Thread(
             target=_background_refresh,
             args=(api_key, inference_base_url),
@@ -169,7 +170,14 @@ def _inject_minimax_quota(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> 
             runtime.get("api_key") or "",
             runtime.get("base_url") or "",
         )
-        snapshot["minimax_quota"] = get_cached_quota()
+        cached = get_cached_quota()
+        if cached is None:
+            global _pending_start
+            _quota_cache = {'pending': True}
+            _pending_start = time.time()
+            snapshot['minimax_quota'] = _quota_cache
+        else:
+            snapshot['minimax_quota'] = cached
     except Exception:
         snapshot["minimax_quota"] = None
 
