@@ -32,6 +32,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Thread
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ def refresh_quota_async(api_key: str, inference_base_url: str) -> None:
     """
     global _quota_cache, _quota_cache_ts
     if _quota_cache is None or (time.time() - _quota_cache_ts) > QUOTA_CACHE_TTL:
-        t = __import__("threading").Thread(
+        t = Thread(
             target=_background_refresh,
             args=(api_key, inference_base_url),
             daemon=True,
@@ -173,9 +174,9 @@ def _inject_minimax_quota(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> 
         snapshot["minimax_quota"] = None
 
 
-# Auto-register the hook so minimax quota is always active
+# Auto-register the hook so minimax quota is always active when imported
 try:
     from hermes_cli.plugins import register_status_bar_snapshot_hook
     register_status_bar_snapshot_hook(_inject_minimax_quota)
-except Exception:
-    pass  # Plugins system not available (e.g. early import)
+except Exception as exc:
+    logger.debug("Auto-registration of minimax quota hook failed (plugins system unavailable): %s", exc)
