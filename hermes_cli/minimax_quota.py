@@ -153,3 +153,29 @@ def refresh_quota_async(api_key: str, inference_base_url: str) -> None:
 def get_cached_quota() -> Optional[Dict[str, Any]]:
     """Return the cached quota dict, or None if not yet fetched."""
     return _quota_cache
+
+
+def _inject_minimax_quota(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> None:
+    """Inject MiniMax Token Plan quota into the status bar snapshot.
+
+    Called automatically via the ``on_status_bar_snapshot`` plugin hook.
+    """
+    provider = runtime.get("provider", "")
+    if provider not in ("minimax", "minimax-cn"):
+        return
+    try:
+        refresh_quota_async(
+            runtime.get("api_key") or "",
+            runtime.get("base_url") or "",
+        )
+        snapshot["minimax_quota"] = get_cached_quota()
+    except Exception:
+        snapshot["minimax_quota"] = None
+
+
+# Auto-register the hook so minimax quota is always active
+try:
+    from hermes_cli.plugins import register_status_bar_snapshot_hook
+    register_status_bar_snapshot_hook(_inject_minimax_quota)
+except Exception:
+    pass  # Plugins system not available (e.g. early import)
