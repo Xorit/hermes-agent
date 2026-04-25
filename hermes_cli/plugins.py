@@ -62,6 +62,7 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    "on_status_bar_snapshot",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -841,3 +842,29 @@ def get_plugin_toolsets() -> List[tuple]:
         result.append((ts_key, label, desc))
 
     return result
+
+
+def register_status_bar_snapshot_hook(fn: Callable[[Dict[str, Any], Dict[str, Any]], None]) -> None:
+    """Register a callback for the ``on_status_bar_snapshot`` hook.
+
+    The callback receives ``(snapshot: Dict, runtime: Dict)`` and should
+    mutate *snapshot* in-place to inject status bar fields.
+    """
+    get_plugin_manager()._hooks.setdefault("on_status_bar_snapshot", []).append(fn)
+
+
+def invoke_status_bar_snapshot_hook(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> None:
+    """Invoke all ``on_status_bar_snapshot`` hooks with the given snapshot and runtime dicts.
+
+    Each hook callback receives ``(snapshot, runtime)`` and mutates *snapshot* in-place.
+    Errors are caught and logged so one bad callback cannot break the status bar.
+    """
+    for cb in get_plugin_manager()._hooks.get("on_status_bar_snapshot", []):
+        try:
+            cb(snapshot, runtime)
+        except Exception as exc:
+            logger.warning(
+                "Hook 'on_status_bar_snapshot' callback %s raised: %s",
+                getattr(cb, "__name__", repr(cb)),
+                exc,
+            )

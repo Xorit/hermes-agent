@@ -1943,20 +1943,12 @@ class HermesCLI:
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
-        # MiniMax Token Plan quota — fire-and-forget, never blocks
+        # MiniMax Token Plan quota — via plugin hook
         try:
-            from hermes_cli.minimax_quota import refresh_quota_async, get_cached_quota
-            from hermes_cli.runtime_provider import resolve_runtime_provider
-            runtime = resolve_runtime_provider()
-            provider = runtime.get("provider", "")
-            if provider in ("minimax", "minimax-cn"):
-                refresh_quota_async(
-                    runtime.get("api_key") or "",
-                    runtime.get("base_url") or "",
-                )
-                snapshot["minimax_quota"] = get_cached_quota()
+            from hermes_cli.plugins import invoke_status_bar_snapshot_hook
+            invoke_status_bar_snapshot_hook(snapshot, runtime)
         except Exception:
-            snapshot["minimax_quota"] = None
+            pass
 
         return snapshot
 
