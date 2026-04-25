@@ -1946,6 +1946,11 @@ class HermesCLI:
         # MiniMax Token Plan quota — via plugin hook
         try:
             from hermes_cli.plugins import invoke_status_bar_snapshot_hook
+            runtime = {
+                "provider": self.provider,
+                "api_key": self.api_key,
+                "base_url": self.base_url,
+            }
             invoke_status_bar_snapshot_hook(snapshot, runtime)
         except Exception:
             pass
