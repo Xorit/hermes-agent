@@ -3321,7 +3321,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             chat_topic=chat_topic,
             is_bot=getattr(message.author, "bot", False),
-            guild_id=str(message.guild.id) if message.guild else None,
+            guild_id=str(getattr(getattr(message, "guild", None), "id", "")) or None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
         )

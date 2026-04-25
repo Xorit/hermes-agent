@@ -2698,7 +2698,8 @@ class GatewayRunner:
             # ── Lifecycle audit log (LIFECYCLE) ─────────────────────────────────
             # Structured record for daily troubleshooting analysis.
             import resource, time as _time_module
-            _uptime_s = _time_module.time() - self._gateway_start_time
+            _start_time = getattr(self, "_gateway_start_time", None) or _time_module.time()
+            _uptime_s = _time_module.time() - _start_time
             _mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
             _active_sessions = list(self._running_agents.keys()) if hasattr(self, '_running_agents') else []
             _exit_type = "restart" if self._restart_requested else "shutdown"
