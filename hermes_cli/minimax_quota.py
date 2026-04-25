@@ -4,20 +4,17 @@ Fetches from GET <base>/v1/api/openplatform/coding_plan/remains where base
 is the API host extracted from the provider's inference_base_url
 (e.g. https://api.minimax.io/anthropic → https://api.minimax.io).
 
-The *_usage_count fields in the API response are REMAINING tokens (not used),
-so: used = total - remaining.
-
-Response shape (model_remains[] entry for "MiniMax-M*"):
+Actual API response shape (model_remains[] entry for "MiniMax-M*"):
 {
-  "model_remains": [
-    {
-      "model_name": "MiniMax-M2.7",
-      "total_usage_count": 1000000,
-      "remaining_usage_count": 670000,   <-- REMAINING, not used!
-      "end_time_ms": 1745534400000,      <-- 5h window reset (ms UTC)
-      "weekly_end_time_ms": 1746057600000 <-- weekly reset (ms UTC)
-    }
-  ]
+  "model_name": "MiniMax-M*",
+  "current_interval_total_count": 4500,
+  "current_interval_usage_count": 4191,   <-- USED tokens (NOT remaining)
+  "end_time": 1777093200000,              <-- interval reset (ms UTC)
+  "current_weekly_total_count": 45000,
+  "current_weekly_usage_count": 32014,   <-- USED tokens (NOT remaining)
+  "weekly_end_time": 1777248000000,      <-- weekly reset (ms UTC)
+  "remains_time": 13723205,               <-- remaining SECONDS in interval
+  "weekly_remains_time": 168523205        <-- remaining SECONDS in week
 }
 """
 
@@ -49,8 +46,8 @@ _pending_start: float = 0.0  # Track when pending state was set
 class MiniMaxQuota:
     """Parsed MiniMax Token Plan quota data."""
     used_percent: int           # 0-100, depleting toward 0 (100 = fully used)
-    reset_time_utc: str         # "Apr 24 20:00 UTC" — 5h window reset
-    weekly_reset_utc: str       # "Apr 28 00:00 UTC" — weekly reset
+    reset_time_utc: str         # "Apr 22 21:00 UTC" — 5h window reset
+    weekly_reset_utc: str       # "Apr 27 00:00 UTC" — weekly reset
     error: Optional[str] = None
 
 
@@ -92,24 +89,27 @@ def _fetch_minimax_quota(api_key: str, inference_base_url: str) -> Dict[str, Any
     entry: Optional[Dict[str, Any]] = None
     for item in model_remains:
         model_name = str(item.get("model_name") or "")
-        if re.match(r"^MiniMax-M\d", model_name):
+        # MiniMax API uses "MiniMax-M*" as a wildcard entry covering all M-series models
+        if re.match(r"^MiniMax-M", model_name) and "*" in model_name:
             entry = item
             break
 
     if not entry:
         return {"error": "MiniMax-M* entry not found in model_remains"}
 
-    total = int(entry.get("total_usage_count") or 0)
-    remaining = int(entry.get("remaining_usage_count") or 0)
+    # Correct field names from the actual API response:
+    # current_interval_usage_count = USED tokens (NOT remaining)
+    # current_interval_total_count = total tokens for the interval
+    total = int(entry.get("current_interval_total_count") or 0)
+    used = int(entry.get("current_interval_usage_count") or 0)
     if total <= 0:
-        return {"error": "invalid total_usage_count"}
+        return {"error": "invalid current_interval_total_count"}
 
-    # *_usage_count fields are REMAINING tokens (not used)
-    used = total - remaining
+    # used_percent depletes toward 0 (100 = fully exhausted)
     used_percent = min(100, max(0, round((used / total) * 100)))
 
-    end_ms = int(entry.get("end_time_ms") or 0)
-    weekly_end_ms = int(entry.get("weekly_end_time_ms") or 0)
+    end_ms = int(entry.get("end_time") or 0)
+    weekly_end_ms = int(entry.get("weekly_end_time") or 0)
 
     def _format_ms(ms: int) -> str:
         if not ms:
@@ -157,27 +157,63 @@ def get_cached_quota() -> Optional[Dict[str, Any]]:
     return _quota_cache
 
 
+def _canonical_minimax_provider(provider: Any, base_url: Any = "") -> str:
+    """Return a canonical provider id, inferring MiniMax from aliases or host.
+
+    Status-bar snapshots can be rendered before the runtime provider has been
+    fully canonicalized (for example while it is still ``auto``).  The MiniMax
+    quota endpoint is tied to the direct MiniMax hosts, so the base URL is a
+    reliable fallback signal when the provider string is still an alias or raw
+    pre-resolution value.
+    """
+    normalized = str(provider or "").strip().lower()
+    try:
+        from hermes_cli.models import normalize_provider
+        normalized = normalize_provider(normalized)
+    except Exception:
+        normalized = {
+            "minimax-china": "minimax-cn",
+            "minimax_cn": "minimax-cn",
+        }.get(normalized, normalized)
+
+    if normalized in ("minimax", "minimax-cn"):
+        return normalized
+
+    try:
+        host = urllib.parse.urlparse(str(base_url or "")).netloc.lower()
+    except Exception:
+        host = ""
+    if host == "api.minimax.io" or host.endswith(".minimax.io"):
+        return "minimax"
+    if host == "api.minimaxi.com" or host.endswith(".minimaxi.com"):
+        return "minimax-cn"
+
+    return normalized
+
+
 def _inject_minimax_quota(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> None:
     """Inject MiniMax Token Plan quota into the status bar snapshot.
 
     Called automatically via the ``on_status_bar_snapshot`` plugin hook.
     """
-    provider = runtime.get("provider", "")
+    global _quota_cache, _pending_start
+
+    base_url = runtime.get("base_url") or ""
+    provider = _canonical_minimax_provider(runtime.get("provider", ""), base_url)
     if provider not in ("minimax", "minimax-cn"):
         return
     try:
         refresh_quota_async(
             runtime.get("api_key") or "",
-            runtime.get("base_url") or "",
+            base_url,
         )
         cached = get_cached_quota()
         if cached is None:
-            global _pending_start
-            _quota_cache = {'pending': True}
+            _quota_cache = {"pending": True}
             _pending_start = time.time()
-            snapshot['minimax_quota'] = _quota_cache
+            snapshot["minimax_quota"] = _quota_cache
         else:
-            snapshot['minimax_quota'] = cached
+            snapshot["minimax_quota"] = cached
     except Exception:
         snapshot["minimax_quota"] = None
 

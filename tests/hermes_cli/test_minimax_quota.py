@@ -9,7 +9,9 @@ import pytest
 
 from hermes_cli.minimax_quota import (
     _build_quota_url,
+    _canonical_minimax_provider,
     _fetch_minimax_quota,
+    _inject_minimax_quota,
     get_cached_quota,
     refresh_quota_async,
     _quota_cache,
@@ -53,14 +55,15 @@ class TestFetchMinimaxQuota:
         return patch("urllib.request.urlopen", return_value=mock_resp)
 
     def test_parses_m2_7_entry(self):
+        # MiniMax API returns "MiniMax-M*" as the wildcard entry
         payload = {
             "model_remains": [
                 {
-                    "model_name": "MiniMax-M2.7",
-                    "total_usage_count": 1_000_000,
-                    "remaining_usage_count": 670_000,
-                    "end_time_ms": 1777060800000,   # 2026-04-24 20:00 UTC
-                    "weekly_end_time_ms": 1777248000000,  # 2026-04-27 00:00 UTC
+                    "model_name": "MiniMax-M*",
+                    "current_interval_total_count": 1_000_000,
+                    "current_interval_usage_count": 330_000,  # USED, not remaining
+                    "end_time": 1777060800000,   # 2026-04-24 20:00 UTC
+                    "weekly_end_time": 1777248000000,  # 2026-04-27 00:00 UTC
                 }
             ]
         }
@@ -68,7 +71,7 @@ class TestFetchMinimaxQuota:
             result = _fetch_minimax_quota("fake-token", "https://api.minimax.io/anthropic")
 
         assert result["error"] is None
-        assert result["used_percent"] == 33  # (1M - 670K) / 1M * 100 = 33
+        assert result["used_percent"] == 33  # 330K / 1M * 100 = 33
         assert result["reset_time_utc"] == "Apr 24 20:00 UTC"
         assert result["weekly_reset_utc"] == "Apr 27 00:00 UTC"
 
@@ -76,11 +79,11 @@ class TestFetchMinimaxQuota:
         payload = {
             "model_remains": [
                 {
-                    "model_name": "MiniMax-M2.7",
-                    "total_usage_count": 1_000_000,
-                    "remaining_usage_count": 0,
-                    "end_time_ms": 1777060800000,
-                    "weekly_end_time_ms": 1777248000000,
+                    "model_name": "MiniMax-M*",
+                    "current_interval_total_count": 1_000_000,
+                    "current_interval_usage_count": 1_000_000,  # fully used
+                    "end_time": 1777060800000,
+                    "weekly_end_time": 1777248000000,
                 }
             ]
         }
@@ -94,11 +97,11 @@ class TestFetchMinimaxQuota:
         payload = {
             "model_remains": [
                 {
-                    "model_name": "MiniMax-M2.7",
-                    "total_usage_count": 1_000_000,
-                    "remaining_usage_count": 1_000_000,
-                    "end_time_ms": 1777060800000,
-                    "weekly_end_time_ms": 1777248000000,
+                    "model_name": "MiniMax-M*",
+                    "current_interval_total_count": 1_000_000,
+                    "current_interval_usage_count": 0,  # unused
+                    "end_time": 1777060800000,
+                    "weekly_end_time": 1777248000000,
                 }
             ]
         }
@@ -108,7 +111,7 @@ class TestFetchMinimaxQuota:
         assert result["used_percent"] == 0
         assert result["error"] is None
 
-    def test_returns_error_when_no_m2_entry(self):
+    def test_returns_error_when_no_mstar_entry(self):
         payload = {"model_remains": [{"model_name": "some-other-model"}]}
         with self._mock_response(payload):
             result = _fetch_minimax_quota("fake-token", "https://api.minimax.io/anthropic")
@@ -126,18 +129,18 @@ class TestFetchMinimaxQuota:
         payload = {
             "model_remains": [
                 {
-                    "model_name": "MiniMax-M2.7",
-                    "total_usage_count": 0,
-                    "remaining_usage_count": 0,
-                    "end_time_ms": 0,
-                    "weekly_end_time_ms": 0,
+                    "model_name": "MiniMax-M*",
+                    "current_interval_total_count": 0,
+                    "current_interval_usage_count": 0,
+                    "end_time": 0,
+                    "weekly_end_time": 0,
                 }
             ]
         }
         with self._mock_response(payload):
             result = _fetch_minimax_quota("fake-token", "https://api.minimax.io/anthropic")
 
-        assert result["error"] == "invalid total_usage_count"
+        assert result["error"] == "invalid current_interval_total_count"
 
 
 # =============================================================================
@@ -158,11 +161,11 @@ class TestCacheBehavior:
         payload = {
             "model_remains": [
                 {
-                    "model_name": "MiniMax-M2.7",
-                    "total_usage_count": 1_000_000,
-                    "remaining_usage_count": 500_000,
-                    "end_time_ms": 1777060800000,
-                    "weekly_end_time_ms": 1777248000000,
+                    "model_name": "MiniMax-M*",
+                    "current_interval_total_count": 1_000_000,
+                    "current_interval_usage_count": 500_000,
+                    "end_time": 1777060800000,
+                    "weekly_end_time": 1777248000000,
                 }
             ]
         }
@@ -204,3 +207,73 @@ class TestCacheBehavior:
 
         # Stale value should still be in cache
         assert get_cached_quota()["used_percent"] == 42
+
+# =============================================================================
+# Status-bar hook provider gating
+# =============================================================================
+
+class TestStatusBarHook:
+    def teardown_method(self):
+        import hermes_cli.minimax_quota as mq
+        mq._quota_cache = None
+        mq._quota_cache_ts = 0.0
+        mq._pending_start = 0.0
+
+    def test_canonical_provider_handles_aliases(self):
+        assert _canonical_minimax_provider("minimax") == "minimax"
+        assert _canonical_minimax_provider("minimax-cn") == "minimax-cn"
+        assert _canonical_minimax_provider("minimax-china") == "minimax-cn"
+        assert _canonical_minimax_provider("minimax_cn") == "minimax-cn"
+
+    def test_canonical_provider_infers_from_global_base_url_when_provider_auto(self):
+        assert (
+            _canonical_minimax_provider("auto", "https://api.minimax.io/anthropic")
+            == "minimax"
+        )
+
+    def test_canonical_provider_infers_from_cn_base_url_when_provider_auto(self):
+        assert (
+            _canonical_minimax_provider("auto", "https://api.minimaxi.com/anthropic")
+            == "minimax-cn"
+        )
+
+    def test_injects_pending_snapshot_when_provider_is_alias(self):
+        snapshot = {}
+        runtime = {
+            "provider": "minimax-china",
+            "api_key": "fake-token",
+            "base_url": "https://api.minimaxi.com/anthropic",
+        }
+        with patch("hermes_cli.minimax_quota.refresh_quota_async") as mock_refresh:
+            _inject_minimax_quota(snapshot, runtime)
+
+        mock_refresh.assert_called_once_with("fake-token", "https://api.minimaxi.com/anthropic")
+        assert snapshot["minimax_quota"] == {"pending": True}
+        assert get_cached_quota() == {"pending": True}
+
+    def test_injects_when_provider_auto_but_base_url_is_minimax(self):
+        snapshot = {}
+        runtime = {
+            "provider": "auto",
+            "api_key": "fake-token",
+            "base_url": "https://api.minimax.io/anthropic",
+        }
+        with patch("hermes_cli.minimax_quota.refresh_quota_async") as mock_refresh:
+            _inject_minimax_quota(snapshot, runtime)
+
+        mock_refresh.assert_called_once_with("fake-token", "https://api.minimax.io/anthropic")
+        assert snapshot["minimax_quota"] == {"pending": True}
+        assert get_cached_quota() == {"pending": True}
+
+    def test_does_not_inject_for_non_minimax_provider_or_host(self):
+        snapshot = {}
+        runtime = {
+            "provider": "openai",
+            "api_key": "fake-token",
+            "base_url": "https://api.openai.com/v1",
+        }
+        with patch("hermes_cli.minimax_quota.refresh_quota_async") as mock_refresh:
+            _inject_minimax_quota(snapshot, runtime)
+
+        mock_refresh.assert_not_called()
+        assert "minimax_quota" not in snapshot
