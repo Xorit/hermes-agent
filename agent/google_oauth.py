@@ -48,9 +48,12 @@ import http.server
 import json
 import logging
 import os
+import queue
 import secrets
+import select
 import socket
 import stat
+import sys
 import threading
 import time
 import urllib.error
@@ -504,8 +507,8 @@ def save_credentials(creds: GoogleCredentials) -> Path:
             try:
                 if tmp_path.exists():
                     tmp_path.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning("Failed to clean up temp credential file %s: %s", tmp_path, exc)
     return path
 
 
@@ -623,7 +626,7 @@ def _fetch_user_email(access_token: str, timeout: float = TOKEN_REQUEST_TIMEOUT_
         data = json.loads(raw)
         return str(data.get("email", "") or "")
     except Exception as exc:
-        logger.debug("Userinfo fetch failed (non-fatal): %s", exc)
+        logger.warning("Userinfo fetch failed (non-fatal): %s", exc)
         return ""
 
 
@@ -633,6 +636,12 @@ def _fetch_user_email(access_token: str, timeout: float = TOKEN_REQUEST_TIMEOUT_
 
 _refresh_inflight: Dict[str, threading.Event] = {}
 _refresh_inflight_lock = threading.Lock()
+# Serialize actual refresh-token exchanges. Google can rotate refresh tokens;
+# concurrent exchanges against the same stored token may invalidate one another.
+_refresh_call_lock = threading.Lock()
+# Shared result dict: rt -> None (success) or an Exception (failure).
+# Used to propagate the owner's error to all waiting threads.
+_refresh_results: Dict[str, Optional[Exception]] = {}
 
 
 def get_valid_access_token(*, force_refresh: bool = False) -> str:
@@ -652,28 +661,46 @@ def get_valid_access_token(*, force_refresh: bool = False) -> str:
     if not force_refresh and not creds.access_token_expired():
         return creds.access_token
 
-    # Dedupe concurrent refreshes by refresh_token
+    # Dedupe concurrent refreshes by refresh_token.
+    # _refresh_inflight_lock protects the in-flight event/result maps.
+    # _refresh_call_lock serializes the actual HTTP refresh call because
+    # Google can rotate refresh tokens; concurrent exchanges against the
+    # same stored token may invalidate one another.
+    # Exceptions from the owner are stored in _refresh_results so that
+    # waiting threads see the same error (e.g. invalid_grant) rather than
+    # trying to re-refresh with wiped credentials.
     rt = creds.refresh_token
     with _refresh_inflight_lock:
         event = _refresh_inflight.get(rt)
         if event is None:
             event = threading.Event()
             _refresh_inflight[rt] = event
+            _refresh_results.pop(rt, None)  # clear stale result from any prior refresh
             owner = True
         else:
             owner = False
 
     if not owner:
-        # Another thread is refreshing — wait, then re-read from disk.
+        # Another thread is refreshing — wait, then check results.
         event.wait(timeout=LOCK_TIMEOUT_SECONDS)
+        # Re-acquire lock briefly to read the shared result.
+        with _refresh_inflight_lock:
+            exc = _refresh_results.get(rt)
+        if exc is not None:
+            # Owner failed; propagate the same error to this thread.
+            raise exc
+        # Owner succeeded; load the updated credentials.
         fresh = load_credentials()
         if fresh is not None and not fresh.access_token_expired():
             return fresh.access_token
-        # Fall through to do our own refresh if the other attempt failed
+        # Fall through: owner's refresh succeeded but creds were since wiped
+        # (e.g. another process cleared them). Proceed to our own refresh.
 
+    # --- owner path: hold the lock for the full HTTP call ---
     try:
         try:
-            resp = refresh_access_token(rt)
+            with _refresh_call_lock:
+                resp = refresh_access_token(rt)
         except GoogleOAuthError as exc:
             if exc.code == "google_oauth_invalid_grant":
                 logger.warning(
@@ -682,6 +709,11 @@ def get_valid_access_token(*, force_refresh: bool = False) -> str:
                     _credentials_path(),
                 )
                 clear_credentials()
+            # Store the exception so waiting threads see the real error,
+            # then signal them before re-raising.
+            with _refresh_inflight_lock:
+                _refresh_results[rt] = exc
+            event.set()
             raise
 
         new_access = str(resp.get("access_token", "") or "").strip()
@@ -698,6 +730,9 @@ def get_valid_access_token(*, force_refresh: bool = False) -> str:
         creds.refresh_token = new_refresh
         creds.expires_ms = int((time.time() + max(60, expires_in)) * 1000)
         save_credentials(creds)
+        # Signal success with None sentinel so waiters re-load from disk.
+        with _refresh_inflight_lock:
+            _refresh_results[rt] = None
         return creds.access_token
     finally:
         if owner:
@@ -850,7 +885,7 @@ def start_oauth_flow(
     state = secrets.token_urlsafe(16)
 
     # If headless, skip the listener and go straight to paste mode
-    if _is_headless() and open_browser:
+    if _is_headless():
         logger.info("Headless environment detected; using paste-mode OAuth fallback.")
         return _paste_mode_login(verifier, challenge, state, client_id, client_secret, project_id)
 
@@ -972,10 +1007,46 @@ def _paste_mode_login(
     return _persist_token_response(token_resp, project_id=project_id)
 
 
+def _timed_input(prompt: str, timeout_seconds: float = 300.0) -> Optional[str]:
+    """Read a line from stdin with a timeout.
+
+    Uses ``select`` on Unix to wait for stdin availability.
+    Returns None on timeout or interrupt.
+    """
+    print(prompt, end="", flush=True)
+    try:
+        # select.select works on file descriptors (ints), not file objects.
+        # Use stdin.buffer (binary) to avoid encoding issues.
+        stdin_fd = sys.stdin.buffer.fileno()
+        rlist, _, _ = select.select([stdin_fd], [], [], timeout_seconds)
+        if not rlist:
+            # Timeout expired
+            return None
+        return sys.stdin.readline().strip()
+    except (OSError, ValueError, AttributeError):
+        # fileno unavailable (e.g. redirected/non-TTY in some environments).
+        # Fall back to a daemon reader thread so abandonment still times out.
+        result: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=1)
+
+        def _reader() -> None:
+            try:
+                result.put(sys.stdin.readline().strip())
+            except Exception:
+                result.put(None)
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        try:
+            return result.get(timeout=timeout_seconds)
+        except queue.Empty:
+            return None
+
+
 def _prompt_paste_fallback() -> Optional[str]:
     print()
     print("Paste the full redirect URL Google showed you, OR just the 'code=' parameter value.")
-    raw = input("Callback URL or code: ").strip()
+    print("(Timeout: 5 minutes. Press Enter with no input to cancel.)")
+    raw = _timed_input("Callback URL or code: ", timeout_seconds=300.0)
     if not raw:
         return None
     if raw.startswith("http://") or raw.startswith("https://"):
