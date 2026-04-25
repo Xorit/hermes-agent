@@ -2102,7 +2102,9 @@ class HermesCLI:
             if quota and not quota.get("pending") and not quota.get("error") and quota.get("used_percent", 0) < 100:
                 used = quota["used_percent"]
                 reset = quota.get("reset_time_utc", "")
-                parts.append(f" │ 5h: {used}% @ {reset}")
+                weekly_used = quota.get("weekly_used_percent", 0)
+                weekly_reset = quota.get("weekly_reset_utc", "")
+                parts.append(f" │ 5h: {used}% @ {reset} │ wk: {weekly_used}% @ {weekly_reset}")
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -2167,8 +2169,12 @@ class HermesCLI:
                     if quota and not quota.get("pending") and not quota.get("error") and quota.get("used_percent", 0) < 100:
                         used = quota["used_percent"]
                         reset = quota.get("reset_time_utc", "")
+                        weekly_used = quota.get("weekly_used_percent", 0)
+                        weekly_reset = quota.get("weekly_reset_utc", "")
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-dim", f"5h: {used}% @ {reset}"))
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", f"wk: {weekly_used}% @ {weekly_reset}"))
                     frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)

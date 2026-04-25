@@ -116,9 +116,15 @@ def _fetch_minimax_quota(api_key: str, inference_base_url: str) -> Dict[str, Any
             return "??"
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%b %d %H:%M UTC")
 
+    # Weekly usage — also depletes toward 0
+    weekly_total = int(entry.get("current_weekly_total_count") or 0)
+    weekly_used = int(entry.get("current_weekly_usage_count") or 0)
+    weekly_used_percent = min(100, max(0, round((weekly_used / weekly_total) * 100))) if weekly_total > 0 else 0
+
     return {
         "used_percent": used_percent,
         "reset_time_utc": _format_ms(end_ms),
+        "weekly_used_percent": weekly_used_percent,
         "weekly_reset_utc": _format_ms(weekly_end_ms),
         "error": None,
     }
