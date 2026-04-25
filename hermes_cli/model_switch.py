@@ -955,11 +955,33 @@ def list_authenticated_providers(
                     has_creds = True
             except Exception as exc:
                 logger.debug("Anthropic external creds check failed: %s", exc)
+        if not has_creds and hermes_slug == "google-gemini-cli":
+            try:
+                from hermes_cli.auth import get_gemini_oauth_auth_status
+
+                google_status = get_gemini_oauth_auth_status()
+                if google_status.get("logged_in"):
+                    has_creds = True
+            except Exception as exc:
+                logger.debug("Google Gemini OAuth creds check failed: %s", exc)
         if not has_creds:
             continue
 
+        # Use live provider catalog when available; google-gemini-cli exposes
+        # account-specific preview access via retrieveUserQuota buckets rather
+        # than a generic /models endpoint.
+        if hermes_slug == "google-gemini-cli":
+            try:
+                from hermes_cli.models import provider_model_ids
+
+                model_ids = provider_model_ids(hermes_slug)
+            except Exception:
+                model_ids = []
+        else:
+            model_ids = []
         # Use curated list — look up by Hermes slug, fall back to overlay key
-        model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
+        if not model_ids:
+            model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
         total = len(model_ids)
         top = model_ids[:max_models]
 

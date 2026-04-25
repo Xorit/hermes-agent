@@ -1663,6 +1663,31 @@ def resolve_provider_client(
             return resolve_provider_client("nous", model, async_mode)
         if provider == "openai-codex":
             return resolve_provider_client("openai-codex", model, async_mode)
+        if provider == "google-gemini-cli":
+            try:
+                from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+                from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials
+
+                creds = resolve_gemini_oauth_runtime_credentials()
+                final_model = _normalize_resolved_model(model or _read_main_model() or "gemini-2.5-flash", provider)
+                client = GeminiCloudCodeClient(
+                    api_key=str(creds.get("api_key", "") or ""),
+                    base_url=str(creds.get("base_url", "") or "cloudcode-pa://google"),
+                    project_id=str(creds.get("project_id", "") or ""),
+                )
+                logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+                # GeminiCloudCodeClient already exposes the OpenAI-compatible
+                # chat.completions facade used by auxiliary helpers.  Returning
+                # it directly for async_mode mirrors copilot-acp's process
+                # client path and avoids constructing AsyncOpenAI for the
+                # marker cloudcode-pa:// scheme.
+                return (client, final_model)
+            except Exception as exc:
+                logger.warning(
+                    "resolve_provider_client: google-gemini-cli requested but OAuth credentials failed: %s",
+                    exc,
+                )
+                return None, None
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)

@@ -268,6 +268,58 @@ class TestStatusBarHook:
         assert snapshot["minimax_quota"] == {"pending": True}
         assert get_cached_quota() == {"pending": True}
 
+    def test_inject_always_reflects_live_cache_not_stale_reference(self):
+        """Regression: snapshot dict must not hold a stale reference to the pending sentinel.
+
+        Previously _inject_minimax_quota() did:
+          snapshot["minimax_quota"] = _quota_cache   # assigns module dict ref
+        On first render _quota_cache was {"pending": True}. When the background
+        thread later filled _quota_cache with real data, the snapshot dict still
+        held the old reference — the status bar stayed frozen at "⟳ fetching…".
+
+        Fix: always dict()-copy the current cache contents into the snapshot.
+        """
+        import hermes_cli.minimax_quota as mq
+
+        # Simulate: first render, cold cache → pending sentinel
+        mq._quota_cache = None
+        mq._quota_cache_ts = 0.0
+
+        snapshot1 = {}
+        runtime = {
+            "provider": "minimax",
+            "api_key": "fake-token",
+            "base_url": "https://api.minimax.io/anthropic",
+        }
+        with patch("hermes_cli.minimax_quota.refresh_quota_async"):
+            _inject_minimax_quota(snapshot1, runtime)
+
+        assert snapshot1["minimax_quota"] == {"pending": True}
+        assert mq._quota_cache == {"pending": True}
+
+        # Simulate: background thread completes, fills cache with real data
+        mq._quota_cache = {
+            "used_percent": 82,
+            "reset_time_utc": "Apr 25 05:00 UTC",
+            "weekly_used_percent": 70,
+            "weekly_reset_utc": "Apr 27 00:00 UTC",
+            "error": None,
+        }
+        mq._quota_cache_ts = time.time()
+
+        # Simulate: second render — snapshot must get the REAL data, not pending
+        snapshot2 = {}
+        with patch("hermes_cli.minimax_quota.refresh_quota_async"):
+            _inject_minimax_quota(snapshot2, runtime)
+
+        assert snapshot2["minimax_quota"] == {
+            "used_percent": 82,
+            "reset_time_utc": "Apr 25 05:00 UTC",
+            "weekly_used_percent": 70,
+            "weekly_reset_utc": "Apr 27 00:00 UTC",
+            "error": None,
+        }
+
     def test_does_not_inject_for_non_minimax_provider_or_host(self):
         snapshot = {}
         runtime = {
