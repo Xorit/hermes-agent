@@ -213,13 +213,16 @@ def _inject_minimax_quota(snapshot: Dict[str, Any], runtime: Dict[str, Any]) -> 
             runtime.get("api_key") or "",
             base_url,
         )
+        # Always read from the live module cache so the snapshot always has the
+        # most recent data.  Snapshot dicts are created fresh on each render, so
+        # copying the cache contents here is safe and ensures the snapshot always
+        # reflects the current quota state (pending → real data after background
+        # fetch completes).
         cached = get_cached_quota()
         if cached is None:
             _quota_cache = {"pending": True}
             _pending_start = time.time()
-            snapshot["minimax_quota"] = _quota_cache
-        else:
-            snapshot["minimax_quota"] = cached
+        snapshot["minimax_quota"] = dict(_quota_cache) if _quota_cache else None
     except Exception:
         snapshot["minimax_quota"] = None
 
