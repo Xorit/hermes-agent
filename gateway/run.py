@@ -1813,14 +1813,6 @@ class GatewayRunner:
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
-        active = self._running_agent_count()
-        if active > 0:
-            logger.warning(
-                "Restart denied: %d active session(s) still running. "
-                "Wait for sessions to complete or use /cancel first.",
-                active,
-            )
-            return False
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
