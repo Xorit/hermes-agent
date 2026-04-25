@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from types import SimpleNamespace
@@ -430,6 +431,7 @@ def _map_gemini_finish_reason(reason: str) -> str:
         "MAX_TOKENS": "length",
         "SAFETY": "content_filter",
         "RECITATION": "content_filter",
+        "PROHIBITED_CONTENT": "content_filter",
         "OTHER": "stop",
     }
     return mapping.get(reason.upper(), "stop")
@@ -558,7 +560,10 @@ def _translate_stream_event(
     finish_reason_raw = str(cand.get("finishReason") or "")
     if finish_reason_raw:
         mapped = _map_gemini_finish_reason(finish_reason_raw)
-        if tool_call_counter[0] > 0:
+        # If tool calls are present, OpenAI uses "tool_calls" as the finish reason.
+        # However, if the actual Gemini reason was a policy violation, preserve that
+        # signal — do not overwrite SAFETY/RECITATION/PROHIBITED_CONTENT with "tool_calls".
+        if tool_call_counter[0] > 0 and mapped != "content_filter":
             mapped = "tool_calls"
         chunks.append(_make_stream_chunk(model=model, finish_reason=mapped))
     return chunks
@@ -604,7 +609,7 @@ class GeminiCloudCodeClient:
         self._default_headers = dict(default_headers or {})
         self._configured_project_id = project_id
         self._project_context: Optional[ProjectContext] = None
-        self._project_context_lock = False  # simple single-thread guard
+        self._project_context_lock = threading.Lock()  # guards lazy _project_context init
         self.chat = _GeminiChatNamespace(self)
         self.is_closed = False
         self._http = httpx.Client(timeout=httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0))
@@ -624,39 +629,49 @@ class GeminiCloudCodeClient:
         self.close()
 
     def _ensure_project_context(self, access_token: str, model: str) -> ProjectContext:
-        """Lazily resolve and cache the project context for this client."""
+        """Lazily resolve and cache the project context for this client.
+
+        Uses double-checked locking to avoid redundant network calls when
+        multiple threads enter concurrently before the cache is populated.
+        """
+        # First check (no lock — fast path for already-cached case)
         if self._project_context is not None:
             return self._project_context
 
-        env_project = google_oauth.resolve_project_id_from_env()
-        creds = google_oauth.load_credentials()
-        stored_project = creds.project_id if creds else ""
+        with self._project_context_lock:
+            # Second check (with lock — another thread may have populated it)
+            if self._project_context is not None:
+                return self._project_context
 
-        # Prefer what's already baked into the creds
-        if stored_project:
-            self._project_context = ProjectContext(
-                project_id=stored_project,
-                managed_project_id=creds.managed_project_id if creds else "",
-                tier_id="",
-                source="stored",
-            )
-            return self._project_context
+            env_project = google_oauth.resolve_project_id_from_env()
+            creds = google_oauth.load_credentials()
+            stored_project = creds.project_id if creds else ""
 
-        ctx = resolve_project_context(
-            access_token,
-            configured_project_id=self._configured_project_id,
-            env_project_id=env_project,
-            user_agent_model=model,
-        )
-        # Persist discovered project back to the creds file so the next
-        # session doesn't re-run the discovery.
-        if ctx.project_id or ctx.managed_project_id:
-            google_oauth.update_project_ids(
-                project_id=ctx.project_id,
-                managed_project_id=ctx.managed_project_id,
+            # Prefer what's already baked into the creds
+            if stored_project:
+                self._project_context = ProjectContext(
+                    project_id=stored_project,
+                    managed_project_id=creds.managed_project_id if creds else "",
+                    tier_id="",
+                    source="stored",
+                )
+                return self._project_context
+
+            ctx = resolve_project_context(
+                access_token,
+                configured_project_id=self._configured_project_id,
+                env_project_id=env_project,
+                user_agent_model=model,
             )
-        self._project_context = ctx
-        return ctx
+            # Persist discovered project back to the creds file so the next
+            # session doesn't re-run the discovery.
+            if ctx.project_id or ctx.managed_project_id:
+                google_oauth.update_project_ids(
+                    project_id=ctx.project_id,
+                    managed_project_id=ctx.managed_project_id,
+                )
+            self._project_context = ctx
+            return ctx
 
     def _create_chat_completion(
         self,

@@ -181,15 +181,56 @@ def _post_json(
         ) from exc
 
 
+def _get_json(
+    url: str,
+    access_token: str,
+    *,
+    timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+    user_agent_model: str = "",
+) -> Dict[str, Any]:
+    """GET a JSON resource with Code Assist auth headers and VPC-SC detection."""
+    request = urllib.request.Request(
+        url, method="GET",
+        headers=_build_headers(access_token, user_agent_model=user_agent_model),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        if _is_vpc_sc_violation(detail):
+            raise CodeAssistError(
+                f"VPC-SC policy violation: {detail}",
+                code="code_assist_vpc_sc",
+            ) from exc
+        raise CodeAssistError(
+            f"Code Assist HTTP {exc.code}: {detail or exc.reason}",
+            code=f"code_assist_http_{exc.code}",
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise CodeAssistError(
+            f"Code Assist request failed: {exc}",
+            code="code_assist_network_error",
+        ) from exc
+
+
 def _is_vpc_sc_violation(body: str) -> bool:
     """Detect a VPC Service Controls violation from a response body."""
     if not body:
         return False
+    body_upper = body.upper()
+    if "SECURITY_POLICY_VIOLATED" in body_upper or "VPC_SERVICE_CONTROLS" in body_upper:
+        return True
     try:
         parsed = json.loads(body)
     except (json.JSONDecodeError, ValueError):
-        return "SECURITY_POLICY_VIOLATED" in body
-    # Walk the nested error structure Google uses
+        return False
+    # Walk the nested error structure Google uses.
     error = parsed.get("error") if isinstance(parsed, dict) else None
     if not isinstance(error, dict):
         return False
@@ -197,11 +238,19 @@ def _is_vpc_sc_violation(body: str) -> bool:
     if isinstance(details, list):
         for item in details:
             if isinstance(item, dict):
-                reason = item.get("reason") or ""
+                reason = str(item.get("reason") or "").upper()
                 if reason == "SECURITY_POLICY_VIOLATED":
                     return True
-    msg = str(error.get("message", ""))
-    return "SECURITY_POLICY_VIOLATED" in msg
+                # Some responses bury VPC-SC under violations[].type.
+                violations = item.get("violations") or []
+                if isinstance(violations, list):
+                    for violation in violations:
+                        if isinstance(violation, dict):
+                            violation_type = str(violation.get("type") or "").upper()
+                            if violation_type == "VPC_SERVICE_CONTROLS":
+                                return True
+    msg = str(error.get("message", "")).upper()
+    return "SECURITY_POLICY_VIOLATED" in msg or "VPC_SERVICE_CONTROLS" in msg
 
 
 # =============================================================================
@@ -325,13 +374,17 @@ def onboard_user(
             time.sleep(_ONBOARDING_POLL_INTERVAL_SECONDS)
             poll_url = f"{endpoint}/v1internal/{op_name}"
             try:
-                poll_resp = _post_json(poll_url, {}, access_token, user_agent_model=user_agent_model)
+                poll_resp = _get_json(poll_url, access_token, user_agent_model=user_agent_model)
             except CodeAssistError as exc:
                 logger.warning("Onboarding poll attempt %d failed: %s", attempt + 1, exc)
                 continue
             if poll_resp.get("done"):
                 return poll_resp
-        logger.warning("Onboarding did not complete within %d attempts", _ONBOARDING_POLL_ATTEMPTS)
+        raise CodeAssistError(
+            f"Onboarding LRO {op_name!r} did not complete within "
+            f"{_ONBOARDING_POLL_ATTEMPTS * _ONBOARDING_POLL_INTERVAL_SECONDS}s.",
+            code="code_assist_lro_timeout",
+        )
     return resp
 
 
@@ -360,6 +413,13 @@ def retrieve_user_quota(
         body["project"] = project_id
     url = f"{CODE_ASSIST_ENDPOINT}/v1internal:retrieveUserQuota"
     resp = _post_json(url, body, access_token, user_agent_model=user_agent_model)
+    # Detect VPC-SC violations that may appear as 200 with an error body.
+    resp_str = json.dumps(resp)
+    if _is_vpc_sc_violation(resp_str):
+        raise CodeAssistError(
+            f"VPC-SC policy violation during quota lookup: {resp_str[:500]}",
+            code="code_assist_vpc_sc",
+        )
     raw_buckets = resp.get("buckets") or []
     buckets: List[QuotaBucket] = []
     if not isinstance(raw_buckets, list):

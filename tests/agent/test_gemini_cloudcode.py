@@ -464,22 +464,44 @@ class TestOnboardUser:
         """Simulate a long-running operation that completes on the second poll."""
         from agent import google_code_assist
 
-        call_count = {"n": 0}
+        calls = {"post": 0, "get": 0}
 
         def fake_post(url, body, token, **kw):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
+            calls["post"] += 1
+            return {"name": "operations/op-abc", "done": False}
+
+        def fake_get(url, token, **kw):
+            calls["get"] += 1
+            if calls["get"] == 1:
                 return {"name": "operations/op-abc", "done": False}
             return {"name": "operations/op-abc", "done": True, "response": {}}
 
         monkeypatch.setattr(google_code_assist, "_post_json", fake_post)
+        monkeypatch.setattr(google_code_assist, "_get_json", fake_get)
         monkeypatch.setattr(google_code_assist.time, "sleep", lambda *_: None)
 
         resp = google_code_assist.onboard_user(
             "at", tier_id="free-tier",
         )
         assert resp["done"] is True
-        assert call_count["n"] >= 2
+        assert calls == {"post": 1, "get": 2}
+
+    def test_lro_timeout_raises_instead_of_returning_incomplete_operation(self, monkeypatch):
+        from agent import google_code_assist
+
+        monkeypatch.setattr(
+            google_code_assist, "_post_json",
+            lambda *a, **kw: {"name": "operations/op-timeout", "done": False},
+        )
+        monkeypatch.setattr(
+            google_code_assist, "_get_json",
+            lambda *a, **kw: {"name": "operations/op-timeout", "done": False},
+        )
+        monkeypatch.setattr(google_code_assist.time, "sleep", lambda *_: None)
+
+        with pytest.raises(google_code_assist.CodeAssistError) as exc_info:
+            google_code_assist.onboard_user("at", tier_id="free-tier")
+        assert exc_info.value.code == "code_assist_lro_timeout"
 
 
 class TestRetrieveUserQuota:
@@ -507,6 +529,16 @@ class TestRetrieveUserQuota:
         assert buckets[0].model_id == "gemini-2.5-pro"
         assert buckets[0].remaining_fraction == 0.75
         assert buckets[1].remaining_fraction == 0.9
+
+    def test_vpc_sc_body_raises_instead_of_empty_quota(self, monkeypatch):
+        from agent import google_code_assist
+
+        fake = {"error": {"details": [{"violations": [{"type": "VPC_SERVICE_CONTROLS"}]}]}}
+        monkeypatch.setattr(google_code_assist, "_post_json", lambda *a, **kw: fake)
+
+        with pytest.raises(google_code_assist.CodeAssistError) as exc_info:
+            google_code_assist.retrieve_user_quota("at", project_id="corp-proj")
+        assert exc_info.value.code == "code_assist_vpc_sc"
 
 
 class TestResolveProjectContext:
@@ -848,6 +880,27 @@ class TestTranslateGeminiResponse:
         assert _map_gemini_finish_reason("MAX_TOKENS") == "length"
         assert _map_gemini_finish_reason("SAFETY") == "content_filter"
         assert _map_gemini_finish_reason("RECITATION") == "content_filter"
+        assert _map_gemini_finish_reason("PROHIBITED_CONTENT") == "content_filter"
+
+    def test_stream_tool_call_does_not_override_safety_finish_reason(self):
+        from agent.gemini_cloudcode_adapter import _translate_stream_event
+
+        chunks = _translate_stream_event(
+            {
+                "response": {
+                    "candidates": [{
+                        "content": {"parts": [{
+                            "functionCall": {"name": "lookup", "args": {"q": "weather"}},
+                        }]},
+                        "finishReason": "SAFETY",
+                    }]
+                }
+            },
+            model="gemini-2.5-flash",
+            tool_call_indices={},
+        )
+
+        assert chunks[-1].choices[0].finish_reason == "content_filter"
 
 
 class TestTranslateStreamEvent:
